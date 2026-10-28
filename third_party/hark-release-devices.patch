@@ -1,0 +1,118 @@
+diff --git a/build.rs b/build.rs
+index 3b79919..dd1bd05 100644
+--- a/build.rs
++++ b/build.rs
+@@ -109,7 +109,7 @@ fn main() {
+     const BACKEND_EXCEPTION: i32 = -100;
+     let backend_exception_define =
+         format!("#define WHISPER_MIDMEETING_BACKEND_EXCEPTION {BACKEND_EXCEPTION}");
+-    let patched: [(&str, Vec<&str>); 2] = [
++    let patched: [(&str, Vec<&str>); 3] = [
+         (
+             "whisper.cpp/src/whisper.cpp",
+             vec![
+@@ -124,6 +124,10 @@ fn main() {
+             ],
+         ),
+         ("whisper.cpp/ggml/src/ggml-alloc.c", vec!["MIDMEETING PATCH: gallocr reserve"]),
++        (
++            "whisper.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp",
++            vec!["HARK PATCH: release devices"],
++        ),
+     ];
+     for (file, markers) in &patched {
+         println!("cargo:rerun-if-changed={file}");
+diff --git a/whisper.cpp/ggml/include/ggml-vulkan.h b/whisper.cpp/ggml/include/ggml-vulkan.h
+index ed5ea5f..5d9ab53 100644
+--- a/whisper.cpp/ggml/include/ggml-vulkan.h
++++ b/whisper.cpp/ggml/include/ggml-vulkan.h
+@@ -24,6 +24,9 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(voi
+ 
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_vk_reg(void);
+ 
++// Destroys every cached Vulkan device that no backend or buffer still uses; returns how many were destroyed.
++GGML_BACKEND_API int ggml_backend_vk_release_devices(void);
++
+ #ifdef  __cplusplus
+ }
+ #endif
+diff --git a/whisper.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/whisper.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index deed505..783b2a8 100644
+--- a/whisper.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/whisper.cpp/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -12991,7 +12991,8 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+     size += 32;  // Behave like the CPU buffer type
+     void * ptr = nullptr;
+     try {
+-        ptr = ggml_vk_host_malloc(vk_instance.devices[0], size);
++        vk_device host_dev = ggml_vk_get_device(0);  // HARK PATCH: release devices (rebuilds after a release)
++        ptr = ggml_vk_host_malloc(host_dev, size);
+     } catch (vk::SystemError& e) {
+         GGML_LOG_WARN("ggml_vulkan: Failed to allocate pinned memory (%s)\n", e.what());
+         // fallback to cpu buffer
+@@ -13008,13 +13009,13 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+ }
+ 
+ static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+-    return vk_instance.devices[0]->properties.limits.minMemoryMapAlignment;
++    return ggml_vk_get_device(0)->properties.limits.minMemoryMapAlignment;  // HARK PATCH: release devices
+ 
+     UNUSED(buft);
+ }
+ 
+ static size_t ggml_backend_vk_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
+-    return vk_instance.devices[0]->suballocation_block_size;
++    return ggml_vk_get_device(0)->suballocation_block_size;  // HARK PATCH: release devices
+ 
+     UNUSED(buft);
+ }
+@@ -14249,6 +14250,49 @@ ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
+     return vk_backend;
+ }
+ 
++// HARK PATCH: release devices
++// The cache and buffer_type.context pin every device; drop them when nothing else holds it.
++int ggml_backend_vk_release_devices(void) {
++    if (!vk_instance_initialized) {
++        return 0;
++    }
++    int released = 0;
++    for (size_t idx = 0; idx < GGML_VK_MAX_DEVICES; idx++) {
++        vk_device & dev = vk_instance.devices[idx];
++        if (dev == nullptr) {
++            continue;
++        }
++        long expected = 2;  // cache + buffer_type.context
++        {
++            std::lock_guard<std::recursive_mutex> guard(dev->mutex);
++            if (!dev->pinned_memory.empty()) {
++                continue;
++            }
++        }
++        if (dev->sync_staging != nullptr) {
++            if (dev->sync_staging.use_count() != 1) {
++                continue;
++            }
++            expected++;  // sync_staging->device
++        }
++        if (dev.use_count() != expected) {
++            continue;
++        }
++        dev->device.waitIdle();
++        ggml_vk_destroy_buffer(dev->sync_staging);
++        delete (ggml_backend_vk_buffer_type_context *) dev->buffer_type.context;
++        dev->buffer_type.context = nullptr;
++        vk_device_ref weak = dev;
++        dev.reset();
++        if (weak.expired()) {
++            released++;
++        } else {
++            GGML_LOG_WARN("ggml_vulkan: device %zu still referenced after release\n", idx);
++        }
++    }
++    return released;
++}
++
+ bool ggml_backend_is_vk(ggml_backend_t backend) {
+     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_vk_guid());
+ }

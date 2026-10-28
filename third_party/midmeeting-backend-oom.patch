@@ -1,0 +1,176 @@
+diff --git a/whisper.cpp/ggml/src/ggml-alloc.c b/whisper.cpp/ggml/src/ggml-alloc.c
+index 41419b6..fae65e2 100644
+--- a/whisper.cpp/ggml/src/ggml-alloc.c
++++ b/whisper.cpp/ggml/src/ggml-alloc.c
+@@ -1069,6 +1069,15 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
+         }
+     }
+ 
++    // MIDMEETING PATCH: gallocr reserve — a failed reserve leaves buffers[i] NULL while node_allocs already
++    // match this graph, so needs_realloc says no; fail here instead of allocating tensors into NULL.
++    for (int i = 0; i < galloc->n_buffers; i++) {
++        if (galloc->buffers[i] == NULL) {
++            GGML_LOG_ERROR("%s: buffer %d is not allocated (a previous reserve failed)\n", __func__, i);
++            return false;
++        }
++    }
++
+     // reset buffers
+     for (int i = 0; i < galloc->n_buffers; i++) {
+         if (galloc->buffers[i] != NULL) {
+diff --git a/whisper.cpp/src/whisper.cpp b/whisper.cpp/src/whisper.cpp
+index 96850a0..ad9dc39 100644
+--- a/whisper.cpp/src/whisper.cpp
++++ b/whisper.cpp/src/whisper.cpp
+@@ -25,6 +25,7 @@
+ #include <cstdio>
+ #include <cstring>
+ #include <fstream>
++#include <exception>
+ #include <functional>
+ #include <map>
+ #include <random>
+@@ -862,7 +863,8 @@ struct whisper_state {
+ 
+     whisper_mel mel;
+ 
+-    whisper_batch batch;
++    // MIDMEETING PATCH: state batch — zeroed so whisper_free_state on an early whisper_init_state failure frees nothing.
++    whisper_batch batch = {};
+ 
+     whisper_decoder decoders[WHISPER_MAX_DECODERS];
+ 
+@@ -1002,6 +1004,7 @@ static bool whisper_kv_cache_init(
+     cache.buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+     if (!cache.buffer) {
+         WHISPER_LOG_ERROR("%s: failed to allocate memory for the kv cache\n", __func__);
++        ggml_free(ctx); // MIDMEETING PATCH: kv cache ctx — was leaked on every failed allocation
+         return false;
+     }
+ 
+@@ -3376,8 +3379,21 @@ static std::string whisper_openvino_get_path_cache(std::string path_bin) {
+ }
+ #endif
+ 
+-struct whisper_state * whisper_init_state(whisper_context * ctx) {
++// MIDMEETING PATCH: unwind guard — frees a half-built context/state only while an exception unwinds past it.
++template <typename T, void (*Free)(T *)>
++struct whisper_unwind_guard {
++    T * ptr;
++    int n_uncaught = std::uncaught_exceptions();
++    ~whisper_unwind_guard() {
++        if (std::uncaught_exceptions() > n_uncaught) {
++            try { Free(ptr); } catch (...) {}
++        }
++    }
++};
++
++static struct whisper_state * whisper_init_state_impl(whisper_context * ctx) {
+     whisper_state * state = new whisper_state;
++    whisper_unwind_guard<whisper_state, whisper_free_state> state_guard { state };
+ 
+     state->backends = whisper_backend_init(ctx->params);
+     if (state->backends.empty()) {
+@@ -3549,6 +3565,18 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
+     return state;
+ }
+ 
++// MIDMEETING PATCH: backend exception (init_state) — see third_party/whisper-rs-sys/PROVENANCE.md
++struct whisper_state * whisper_init_state(whisper_context * ctx) {
++    try {
++        return whisper_init_state_impl(ctx);
++    } catch (const std::exception & e) {
++        WHISPER_LOG_ERROR("%s: ggml backend threw, no state created: %s\n", __func__, e.what());
++    } catch (...) {
++        WHISPER_LOG_ERROR("%s: ggml backend threw an unknown exception, no state created\n", __func__);
++    }
++    return nullptr;
++}
++
+ int whisper_ctx_init_openvino_encoder_with_state(
+         struct whisper_context * ctx,
+           struct whisper_state * state,
+@@ -3707,7 +3735,7 @@ struct whisper_context * whisper_init_from_buffer_with_params_no_state(void * bu
+     return whisper_init_with_params_no_state(&loader, params);
+ }
+ 
+-struct whisper_context * whisper_init_with_params_no_state(struct whisper_model_loader * loader, struct whisper_context_params params) {
++static struct whisper_context * whisper_init_with_params_no_state_impl(struct whisper_model_loader * loader, struct whisper_context_params params) {
+     ggml_time_init();
+ 
+     if (params.flash_attn && params.dtw_token_timestamps) {
+@@ -3724,11 +3752,12 @@ struct whisper_context * whisper_init_with_params_no_state(struct whisper_model_
+ 
+     whisper_context * ctx = new whisper_context;
+     ctx->params = params;
++    whisper_unwind_guard<whisper_context, whisper_free> ctx_guard { ctx };
+ 
+     if (!whisper_model_load(loader, *ctx)) {
+         loader->close(loader->context);
+         WHISPER_LOG_ERROR("%s: failed to load model\n", __func__);
+-        delete ctx;
++        whisper_free(ctx); // MIDMEETING PATCH: load failure frees — `delete ctx` leaked model.ctxs and model.buffers (VRAM)
+         return nullptr;
+     }
+ 
+@@ -3737,6 +3766,18 @@ struct whisper_context * whisper_init_with_params_no_state(struct whisper_model_
+     return ctx;
+ }
+ 
++// MIDMEETING PATCH: backend exception (model load) — see third_party/whisper-rs-sys/PROVENANCE.md
++struct whisper_context * whisper_init_with_params_no_state(struct whisper_model_loader * loader, struct whisper_context_params params) {
++    try {
++        return whisper_init_with_params_no_state_impl(loader, params);
++    } catch (const std::exception & e) {
++        WHISPER_LOG_ERROR("%s: ggml backend threw, model not loaded: %s\n", __func__, e.what());
++    } catch (...) {
++        WHISPER_LOG_ERROR("%s: ggml backend threw an unknown exception, model not loaded\n", __func__);
++    }
++    return nullptr;
++}
++
+ struct whisper_context * whisper_init_from_file_with_params(const char * path_model, struct whisper_context_params params) {
+     whisper_context * ctx = whisper_init_from_file_with_params_no_state(path_model, params);
+     if (!ctx) {
+@@ -6794,7 +6835,7 @@ static bool whisper_vad(
+     return true;
+ }
+ 
+-int whisper_full_with_state(
++static int whisper_full_with_state_impl(
+         struct whisper_context * ctx,
+           struct whisper_state * state,
+     struct whisper_full_params   params,
+@@ -7745,6 +7786,32 @@ int whisper_full_with_state(
+     return 0;
+ }
+ 
++// MIDMEETING PATCH: backend exception — e.g. vk::OutOfDeviceMemoryError from ggml-vulkan must not unwind into Rust.
++// Returns WHISPER_MIDMEETING_BACKEND_EXCEPTION; the state's GPU backend is then unfit for reuse.
++#define WHISPER_MIDMEETING_BACKEND_EXCEPTION -100
++int whisper_full_with_state(
++        struct whisper_context * ctx,
++          struct whisper_state * state,
++    struct whisper_full_params   params,
++                   const float * samples,
++                           int   n_samples) {
++    try {
++        return whisper_full_with_state_impl(ctx, state, params, samples, n_samples);
++    } catch (const std::exception & e) {
++        WHISPER_LOG_ERROR("%s: ggml backend threw, returning %d: %s\n", __func__, WHISPER_MIDMEETING_BACKEND_EXCEPTION, e.what());
++    } catch (...) {
++        WHISPER_LOG_ERROR("%s: ggml backend threw an unknown exception, returning %d\n", __func__, WHISPER_MIDMEETING_BACKEND_EXCEPTION);
++    }
++    if (state) {
++        for (auto * s : { &state->sched_conv, &state->sched_encode, &state->sched_cross, &state->sched_decode }) {
++            if (s->sched) {
++                ggml_backend_sched_reset(s->sched);
++            }
++        }
++    }
++    return WHISPER_MIDMEETING_BACKEND_EXCEPTION;
++}
++
+ int whisper_full(
+         struct whisper_context * ctx,
+     struct whisper_full_params   params,

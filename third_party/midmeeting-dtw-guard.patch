@@ -1,0 +1,66 @@
+diff -ruN a/build.rs b/build.rs
+--- a/build.rs
++++ b/build.rs
+@@ -105,16 +105,29 @@
+     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+     let whisper_root = out.join("whisper.cpp");
+ 
+-    if !whisper_root.exists() {
+-        std::fs::create_dir_all(&whisper_root).unwrap();
+-        fs_extra::dir::copy("./whisper.cpp", &out, &Default::default()).unwrap_or_else(|e| {
+-            panic!(
+-                "Failed to copy whisper sources into {}: {}",
+-                whisper_root.display(),
+-                e
+-            )
+-        });
++    println!("cargo:rerun-if-changed=whisper.cpp/src/whisper.cpp");
++    let patched_source = std::fs::read_to_string("whisper.cpp/src/whisper.cpp")
++        .expect("Failed to read whisper.cpp/src/whisper.cpp");
++    if !patched_source.contains("MIDMEETING PATCH") {
++        panic!(
++            "whisper.cpp/src/whisper.cpp is missing the MIDMEETING PATCH DTW guard \
++             (whisper_exp_compute_token_level_timestamps_dtw); see third_party/whisper-rs-sys/PROVENANCE.md"
++        );
+     }
++    std::fs::write(out.join("midmeeting_guard.rs"), "pub const MIDMEETING_DTW_GUARD: u32 = 1;\n")
++        .expect("Failed to write midmeeting_guard.rs");
++
++    if whisper_root.exists() {
++        std::fs::remove_dir_all(&whisper_root).unwrap();
++    }
++    std::fs::create_dir_all(&whisper_root).unwrap();
++    fs_extra::dir::copy("./whisper.cpp", &out, &Default::default()).unwrap_or_else(|e| {
++        panic!(
++            "Failed to copy whisper sources into {}: {}",
++            whisper_root.display(),
++            e
++        )
++    });
+ 
+     if env::var("WHISPER_DONT_GENERATE_BINDINGS").is_ok() {
+         let _: u64 = std::fs::copy("src/bindings.rs", out.join("bindings.rs"))
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -3,3 +3,4 @@
+ #![allow(non_snake_case)]
+ 
+ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
++include!(concat!(env!("OUT_DIR"), "/midmeeting_guard.rs"));
+diff -ruN a/whisper.cpp/src/whisper.cpp b/whisper.cpp/src/whisper.cpp
+--- a/whisper.cpp/src/whisper.cpp
++++ b/whisper.cpp/src/whisper.cpp
+@@ -8815,6 +8815,12 @@
+     WHISPER_ASSERT(n_frames <= n_audio_ctx * 2);
+     WHISPER_ASSERT(ctx->params.dtw_aheads_preset != WHISPER_AHEADS_NONE);
+ 
++    // MIDMEETING PATCH: median_filter() asserts filter_width < n_frames/2 and abort()s the process — see third_party/whisper-rs-sys/PROVENANCE.md
++    if (n_frames / 2 <= medfilt_width) {
++        WHISPER_LOG_WARN("%s: skipping DTW alignment on a %d-frame window (needs >= %d)\n", __func__, n_frames, 2*medfilt_width + 2);
++        return;
++    }
++
+     // FIXME: Allocating mem everytime we call this func
+     // Our ggml buffer should be pre-allocated somewhere during init and reused
+     // when we call this function

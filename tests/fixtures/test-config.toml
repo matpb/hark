@@ -1,0 +1,10 @@
+[server]
+listen = "127.0.0.1:18797"
+
+[vocabulary.default]
+terms = ["Oluwaseun", "Ghidra", "Yggdrasil", "Zstandard"]
+files = []
+wspr_config = ""
+
+[vocabulary.legal]
+terms = ["subpoena", "estoppel"]

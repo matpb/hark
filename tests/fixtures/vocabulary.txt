@@ -1,0 +1,1 @@
+Oluwaseun reverse engineered the firmware in Ghidra, then compressed the Yggdrasil logs with Zstandard.

@@ -1,0 +1,57 @@
+# hark configuration. Every key is shown with its default; an empty file works too.
+# Reload vocabulary profiles with `systemctl --user kill -s HUP hark`; other keys need a restart.
+
+[server]
+listen = "127.0.0.1:8797"        # non-loopback is refused unless allow_non_loopback = true
+allow_non_loopback = false
+allow_unauthenticated_remote = false  # non-loopback without api_key_file is refused unless true
+allowed_hosts = []               # extra Host header values accepted besides 127.0.0.1, localhost and [::1]
+api_key_file = ""                # empty = no key; the file must be mode 0600
+max_upload_mb = 500
+max_concurrent_uploads = 4       # upload bodies read at once; more get 429
+sync_max_audio_secs = 1800       # longer audio must go through the jobs API
+max_interactive_waiting = 16     # interactive requests waiting beyond this get 429
+ffmpeg_timeout_secs = 300
+log_text = false                 # true logs transcript text at debug level
+log_file = ""                    # empty = logs go to stderr; a path appends them there (used by the Windows task)
+
+[engine]
+device = "auto"                  # auto | cpu | gpu:N
+default_model = "large-v3-turbo"
+preload = true
+states = 2                       # concurrent decodes per loaded model; 1 saves VRAM
+max_loaded_models = 1
+idle_unload_secs = 900           # 0 = never unload
+cpu_threads = 8
+gpu_retry_secs = 600             # after a GPU fallback, retry the GPU this often when idle; 0 = never
+recycle_after_chunks = 500       # recreate the GPU device after this many decoded chunks to bound driver memory; 0 = never
+
+[models]
+dir = "~/.local/share/hark/models"
+extra_dirs = ["~/.config/Wspr/models"]   # read-only; hark never writes or deletes here
+
+[models.word_timestamps]
+"large-v3-turbo" = "dtw"         # dtw | heuristic
+
+[aliases]
+# "whisper-1" follows engine.default_model unless set here, for example:
+# "whisper-1" = "large-v3-turbo"
+
+[vad]
+enabled = true
+model = "ggml-silero-v5.1.2.bin"
+
+[jobs]
+dir = "~/.local/state/hark/jobs"
+path_roots = ["~"]               # job files must sit under one of these
+keep_results_days = 7
+ffmpeg_timeout_secs = 3600
+min_free_mb = 2048               # job uploads are refused (507) below this much free disk
+max_queued = 100                 # queued jobs beyond this get 429
+
+# Vocabulary profiles: terms are sent to whisper as an initial prompt. Without a [vocabulary.default]
+# table, `default` imports ~/.config/Wspr/config.json when that file exists.
+# [vocabulary.default]
+# terms = ["Kubernetes", "PostgreSQL"]
+# files = []                     # text files, one term per line
+# wspr_config = ""               # path to a Wspr config.json to import its custom vocabulary

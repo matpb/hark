@@ -1,0 +1,14 @@
+diff -ruN a/whisper.cpp/src/whisper.cpp b/whisper.cpp/src/whisper.cpp
+--- a/whisper.cpp/src/whisper.cpp
++++ b/whisper.cpp/src/whisper.cpp
+@@ -1855,6 +1855,11 @@
+
+             size_t size_main = ggml_backend_buffer_get_size(buf);
+             WHISPER_LOG_INFO("%s: %12s total size = %8.2f MB\n", __func__, ggml_backend_buffer_name(buf), size_main / 1e6);
++        } else {
++            // MIDMEETING PATCH: model buffer — alloc_tensor_range frees earlier ctx_map buffers
++            // on failure; loading weights into them below would use-after-free. See PROVENANCE.md.
++            WHISPER_LOG_ERROR("%s: failed to allocate the %s model buffer\n", __func__, ggml_backend_buft_name(buft));
++            return false;
+         }
+     }

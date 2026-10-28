@@ -1,0 +1,49 @@
+[package]
+name = "hark"
+version = "1.0.0"
+edition = "2024"
+description = "Local OpenAI-compatible transcription daemon (whisper.cpp via whisper-rs)"
+license = "MIT"
+repository = "https://github.com/matpb/hark"
+readme = "README.md"
+publish = false
+
+[features]
+default = []
+vulkan = ["whisper-rs/vulkan"]
+metal = ["whisper-rs/metal"]
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["multipart"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+flate2 = { version = "1", default-features = false, features = ["zlib"] }
+hound = "3"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+whisper-rs = { version = "0.16", default-features = false, features = ["raw-api", "tracing_backend"] }
+
+[target.'cfg(windows)'.dependencies]
+fs4 = "1"
+getrandom = "0.2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+futures-util = { version = "0.3", default-features = false }
+
+[patch.crates-io]
+whisper-rs-sys = { path = "third_party/whisper-rs-sys" }
+
+[profile.dev]
+opt-level = 1

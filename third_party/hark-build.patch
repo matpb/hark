@@ -1,0 +1,98 @@
+diff --git a/build.rs b/build.rs
+--- a/build.rs
++++ b/build.rs
+@@ -105,17 +105,46 @@
+     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+     let whisper_root = out.join("whisper.cpp");
+ 
+-    println!("cargo:rerun-if-changed=whisper.cpp/src/whisper.cpp");
+-    let patched_source = std::fs::read_to_string("whisper.cpp/src/whisper.cpp")
+-        .expect("Failed to read whisper.cpp/src/whisper.cpp");
+-    if !patched_source.contains("MIDMEETING PATCH") {
+-        panic!(
+-            "whisper.cpp/src/whisper.cpp is missing the MIDMEETING PATCH DTW guard \
+-             (whisper_exp_compute_token_level_timestamps_dtw); see third_party/whisper-rs-sys/PROVENANCE.md"
+-        );
++    // Keep in sync with WHISPER_MIDMEETING_BACKEND_EXCEPTION in whisper.cpp; checked below.
++    const BACKEND_EXCEPTION: i32 = -100;
++    let backend_exception_define =
++        format!("#define WHISPER_MIDMEETING_BACKEND_EXCEPTION {BACKEND_EXCEPTION}");
++    let patched: [(&str, Vec<&str>); 2] = [
++        (
++            "whisper.cpp/src/whisper.cpp",
++            vec![
++                "MIDMEETING PATCH: median_filter",
++                "MIDMEETING PATCH: model buffer",
++                "MIDMEETING PATCH: backend exception",
++                "MIDMEETING PATCH: state batch",
++                "MIDMEETING PATCH: kv cache ctx",
++                "MIDMEETING PATCH: unwind guard",
++                "MIDMEETING PATCH: load failure frees",
++                &backend_exception_define,
++            ],
++        ),
++        ("whisper.cpp/ggml/src/ggml-alloc.c", vec!["MIDMEETING PATCH: gallocr reserve"]),
++    ];
++    for (file, markers) in &patched {
++        println!("cargo:rerun-if-changed={file}");
++        let source =
++            std::fs::read_to_string(file).unwrap_or_else(|e| panic!("Failed to read {file}: {e}"));
++        let missing: Vec<&&str> = markers.iter().filter(|m| !source.contains(**m)).collect();
++        if !missing.is_empty() {
++            panic!(
++                "{file} is missing patch marker(s) {missing:?}; \
++                 see third_party/whisper-rs-sys/PROVENANCE.md"
++            );
++        }
+     }
+-    std::fs::write(out.join("midmeeting_guard.rs"), "pub const MIDMEETING_DTW_GUARD: u32 = 1;\n")
+-        .expect("Failed to write midmeeting_guard.rs");
++    std::fs::write(
++        out.join("midmeeting_guard.rs"),
++        format!(
++            "pub const MIDMEETING_DTW_GUARD: u32 = 1;\n\
++             pub const MIDMEETING_BACKEND_EXCEPTION: i32 = {BACKEND_EXCEPTION};\n"
++        ),
++    )
++    .expect("Failed to write midmeeting_guard.rs");
+ 
+     if whisper_root.exists() {
+         std::fs::remove_dir_all(&whisper_root).unwrap();
+@@ -191,6 +220,10 @@
+         return;
+     }
+ 
++    // A cached compiler path that differs (/usr/bin/cc vs /usr/sbin/cc) makes CMake wipe the cache and
++    // reconfigure without our -D flags, turning on whisper.cpp's tests/examples, which are not vendored.
++    let _ = std::fs::remove_file(out.join("build").join("CMakeCache.txt"));
++
+     let mut config = Config::new(&whisper_root);
+ 
+     config
+@@ -203,7 +236,7 @@
+         .very_verbose(true)
+         .pic(true);
+ 
+-    if cfg!(target_os = "windows") {
++    if target.contains("windows") {
+         config.cxxflag("/utf-8");
+         println!("cargo:rustc-link-lib=advapi32");
+     }
+@@ -231,7 +264,7 @@
+ 
+     if cfg!(feature = "vulkan") {
+         config.define("GGML_VULKAN", "ON");
+-        if cfg!(windows) {
++        if target.contains("windows") {
+             println!("cargo:rerun-if-env-changed=VULKAN_SDK");
+             println!("cargo:rustc-link-lib=vulkan-1");
+             let vulkan_path = match env::var("VULKAN_SDK") {
+@@ -242,7 +275,7 @@
+             };
+             let vulkan_lib_path = vulkan_path.join("Lib");
+             println!("cargo:rustc-link-search={}", vulkan_lib_path.display());
+-        } else if cfg!(target_os = "macos") {
++        } else if target.contains("apple") {
+             println!("cargo:rerun-if-env-changed=VULKAN_SDK");
+             println!("cargo:rustc-link-lib=vulkan");
+             let vulkan_path = match env::var("VULKAN_SDK") {

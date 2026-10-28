@@ -1,0 +1,35 @@
+[Unit]
+Description=hark: local OpenAI-compatible transcription daemon
+Documentation=file://%h/.config/hark/config.toml
+After=default.target
+
+[Service]
+Type=notify
+ExecStart=%h/.local/bin/hark serve
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=120
+TimeoutStopSec=60
+NoNewPrivileges=yes
+# PrivateTmp hides /tmp from jobs.path_roots; keep media outside /tmp (hark doctor warns).
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+UMask=0077
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Left off on purpose: PrivateDevices, DeviceAllow, MemoryDenyWriteExecute, ProtectHome, PrivateNetwork and
+# ProcSubset=pid, because the GPU driver, shader JIT, model and job paths in $HOME, and nvidia-smi need them.
+
+[Install]
+WantedBy=default.target
