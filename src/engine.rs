@@ -1286,10 +1286,15 @@ const REPAIR_LEAD_SECS: f64 = 0.5;
 /// `entropy_thold` of the repair pass: widened so whisper's temperature fallback trips on a loop.
 const REPAIR_ENTROPY_THOLD: f32 = 2.9;
 
-/// Where a repetition run starts in `segments`, minus the lead, clamped to the chunk start.
+/// Where a repetition or collapsed-timestamp run starts in `segments`, minus the lead.
+/// The result is clamped to the chunk start.
 pub fn repair_start(segments: &[Segment], chunk_start_secs: f64) -> Option<f64> {
     let (_, reports) = pipeline::guard_repetitions(segments.to_vec());
-    let earliest = reports.iter().map(|r| r.start).reduce(f64::min)?;
+    let repeats = reports.iter().map(|r| r.start);
+    let collapsed = pipeline::collapsed_runs(segments)
+        .into_iter()
+        .map(|(start, _)| start);
+    let earliest = repeats.chain(collapsed).reduce(f64::min)?;
     Some((earliest - REPAIR_LEAD_SECS).max(chunk_start_secs))
 }
 
@@ -1455,6 +1460,7 @@ fn decode_chunk(
     let mut segments = collect_segments(loaded, state, offset_samples)?;
 
     let chunk_start = offset_samples as f64 / f64::from(crate::audio::SAMPLE_RATE);
+    let chunk_end = chunk_start + audio.len() as f64 / f64::from(crate::audio::SAMPLE_RATE);
     if let Some(from) = repair_start(&segments, chunk_start) {
         let rel = (((from - chunk_start) * f64::from(crate::audio::SAMPLE_RATE)) as usize)
             .min(audio.len());
@@ -1476,19 +1482,23 @@ fn decode_chunk(
             match ran {
                 Ok(()) => {
                     let repaired = collect_segments(loaded, state, offset_samples + rel)?;
-                    if repair_start(&repaired, from).is_some() {
+                    let original_from: Vec<Segment> =
+                        segments.iter().filter(|s| s.end > from).cloned().collect();
+                    let before = pipeline::damage(&original_from);
+                    let after = pipeline::damage(&repaired);
+                    if after < before {
+                        tracing::info!(
+                            from = format_args!("{from:.1}"),
+                            damage_before = before,
+                            damage_after = after,
+                            "re-decoded a looped span"
+                        );
+                        segments = splice_repair(segments, repaired, from, chunk_end);
+                    } else {
                         tracing::warn!(
                             from = format_args!("{from:.1}"),
                             "repair pass looped too; keeping the original"
                         );
-                    } else {
-                        tracing::info!(
-                            from = format_args!("{from:.1}"),
-                            "re-decoded a looped span"
-                        );
-                        let chunk_end =
-                            chunk_start + audio.len() as f64 / f64::from(crate::audio::SAMPLE_RATE);
-                        segments = splice_repair(segments, repaired, from, chunk_end);
                     }
                 }
                 Err(e @ WhisperError::GenericError(-7)) => return Err(e.into()),
@@ -1496,6 +1506,10 @@ fn decode_chunk(
                 Err(e) => tracing::warn!(error = %e, "repair decode failed; keeping the original"),
             }
         }
+    }
+    let (segments, dropped) = pipeline::drop_collapsed_tail(segments, chunk_end);
+    if dropped > 0 {
+        tracing::info!("dropped collapsed tail words={dropped}");
     }
     Ok(ChunkOut { segments, detected })
 }
@@ -1683,6 +1697,58 @@ mod tests {
         assert_eq!(repair_start(&segs[..1], 0.0), None);
         let clean = vec![seg(0.0, 2.0, " a b c"), seg(2.0, 4.0, " d e f")];
         assert_eq!(repair_start(&clean, 0.0), None);
+    }
+
+    /// A segment whose words are (text, start, end); its text is the words joined by spaces.
+    fn seg_with_words(words: &[(&str, f64, f64)]) -> Segment {
+        let start = words.first().map_or(0.0, |w| w.1);
+        let end = words.last().map_or(0.0, |w| w.2);
+        let text = words.iter().map(|w| w.0).collect::<Vec<_>>().join(" ");
+        Segment {
+            words: words
+                .iter()
+                .map(|&(w, s, e)| pipeline::Word {
+                    word: w.into(),
+                    start: s,
+                    end: e,
+                })
+                .collect(),
+            ..seg(start, end, &text)
+        }
+    }
+
+    #[test]
+    fn repair_starts_on_a_collapsed_run_without_a_repetition() {
+        let run: Vec<(&str, f64, f64)> = [
+            "one", "two", "three", "four", "five", "six", "seven", "eight",
+        ]
+        .iter()
+        .map(|w| (*w, 300.0, 300.0))
+        .collect();
+        let segs = vec![
+            seg_with_words(&[("The", 0.0, 0.5), ("quick", 1.0, 1.5)]),
+            seg_with_words(&run),
+        ];
+        assert!(pipeline::guard_repetitions(segs.clone()).1.is_empty());
+        assert_eq!(repair_start(&segs, 240.0), Some(299.5));
+        assert_eq!(
+            repair_start(&segs, 299.8),
+            Some(299.8),
+            "clamped to the chunk start"
+        );
+    }
+
+    #[test]
+    fn repair_stays_off_for_normally_timed_words() {
+        let words: Vec<(&str, f64, f64)> =
+            ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"]
+                .iter()
+                .enumerate()
+                .map(|(k, w)| (*w, k as f64, k as f64 + 0.5))
+                .collect();
+        assert_eq!(repair_start(&[seg_with_words(&words)], 0.0), None);
+        let seven: Vec<(&str, f64, f64)> = (0..7).map(|_| ("x", 300.0, 300.0)).collect();
+        assert_eq!(repair_start(&[seg_with_words(&seven)], 0.0), None);
     }
 
     #[test]

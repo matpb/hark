@@ -360,6 +360,11 @@ pub fn mean_logprob(tokens: &[TokenInfo], eot: i32) -> f64 {
 const REPEAT_MAX_PHRASE_WORDS: usize = 12;
 const REPEAT_MIN_COUNT: [usize; REPEAT_MAX_PHRASE_WORDS + 1] =
     [0, 10, 8, 6, 5, 3, 3, 3, 3, 3, 3, 3, 3];
+/// Minimum words in a run whose timestamps all fall inside COLLAPSED_SPAN_SECS.
+pub const COLLAPSED_MIN_WORDS: usize = 8;
+pub const COLLAPSED_SPAN_SECS: f64 = 0.1;
+/// Collapsed runs starting within this many seconds of the chunk end are dropped, not re-decoded.
+pub const COLLAPSED_TAIL_SECS: f64 = 1.0;
 
 /// One collapsed repetition run; the phrase text is deliberately not kept.
 #[derive(Debug, Clone, PartialEq)]
@@ -474,6 +479,109 @@ pub fn guard_repetitions(segments: Vec<Segment>) -> (Vec<Segment>, Vec<Repetitio
         })
         .collect();
     (rebuilt.into_iter().flatten().collect(), reports)
+}
+
+/// (start, end) of every word in order, clamped forward as in `finalize_segments`.
+fn clamped_times(segments: &[Segment]) -> Vec<(f64, f64)> {
+    let mut last_start = f64::NEG_INFINITY;
+    segments
+        .iter()
+        .flat_map(|s| s.words.iter())
+        .map(|w| {
+            let start = w.start.max(last_start);
+            last_start = start;
+            (start, w.end.max(start))
+        })
+        .collect()
+}
+
+/// (first word index, word count) of each maximal collapsed run in `times`.
+fn collapsed_index_runs(times: &[(f64, f64)]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < times.len() {
+        let first = times[i].0;
+        let mut j = i;
+        while j < times.len() && times[j].1 - first <= COLLAPSED_SPAN_SECS {
+            j += 1;
+        }
+        let count = j - i;
+        if count >= COLLAPSED_MIN_WORDS {
+            runs.push((i, count));
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    runs
+}
+
+/// (start, word count) of each maximal run of >= COLLAPSED_MIN_WORDS words spanning <= COLLAPSED_SPAN_SECS.
+/// Times are clamped forward as in `finalize_segments`, so words that jump back count as collapsed.
+pub fn collapsed_runs(segments: &[Segment]) -> Vec<(f64, usize)> {
+    let times = clamped_times(segments);
+    collapsed_index_runs(&times)
+        .into_iter()
+        .map(|(i, n)| (times[i].0, n))
+        .collect()
+}
+
+/// Removes words of collapsed runs starting at or after `chunk_end - COLLAPSED_TAIL_SECS`; returns words removed.
+/// Segments that lose every word are removed; partly emptied segments are rebuilt from their kept words.
+pub fn drop_collapsed_tail(segments: Vec<Segment>, chunk_end: f64) -> (Vec<Segment>, usize) {
+    let times = clamped_times(&segments);
+    let tail_start = chunk_end - COLLAPSED_TAIL_SECS;
+    let mut dropped = vec![false; times.len()];
+    let mut removed = 0;
+    for (first, count) in collapsed_index_runs(&times) {
+        if times[first].0 >= tail_start {
+            dropped[first..first + count].fill(true);
+            removed += count;
+        }
+    }
+    if removed == 0 {
+        return (segments, 0);
+    }
+    let mut out = Vec::with_capacity(segments.len());
+    let mut flat = 0;
+    for seg in segments {
+        let gone = &dropped[flat..flat + seg.words.len()];
+        flat += gone.len();
+        if gone.iter().all(|d| !*d) {
+            out.push(seg);
+        } else if !gone.iter().all(|d| *d) {
+            let words: Vec<Word> = seg
+                .words
+                .iter()
+                .zip(gone)
+                .filter(|(_, d)| !**d)
+                .map(|(w, _)| w.clone())
+                .collect();
+            let lead = if seg.text.starts_with(char::is_whitespace) {
+                " "
+            } else {
+                ""
+            };
+            let joined: Vec<&str> = words.iter().map(|w| w.word.as_str()).collect();
+            let text = format!("{lead}{}", joined.join(" "));
+            let end = words.last().map_or(seg.end, |w| w.end);
+            out.push(Segment {
+                text,
+                end,
+                words,
+                ..seg
+            });
+        }
+    }
+    (out, removed)
+}
+
+/// Words inside collapsed runs plus words dropped by the repetition guard.
+pub fn damage(segments: &[Segment]) -> usize {
+    let collapsed: usize = collapsed_runs(segments).iter().map(|(_, n)| n).sum();
+    let (_, reports) = guard_repetitions(segments.to_vec());
+    let dropped: usize = reports.iter().map(|r| r.dropped_words).sum();
+    collapsed + dropped
 }
 
 /// Aligns token-built words to the whitespace words of the text and drops the flagged ones.
@@ -1107,5 +1215,131 @@ mod tests {
         assert_eq!(out.iter().map(|s| s.id).collect::<Vec<_>>(), vec![0, 1]);
         assert_eq!(out[1].words[0].start, 5.0);
         assert!(out[1].words[0].end >= 5.0);
+    }
+
+    /// A segment whose words are (text, start, end); its text is the words joined by spaces.
+    fn timed(words: &[(&str, f64, f64)]) -> Segment {
+        let start = words.first().map_or(0.0, |w| w.1);
+        let end = words.last().map_or(0.0, |w| w.2);
+        let text = words.iter().map(|w| w.0).collect::<Vec<_>>().join(" ");
+        Segment {
+            words: words
+                .iter()
+                .map(|&(w, s, e)| Word {
+                    word: w.into(),
+                    start: s,
+                    end: e,
+                })
+                .collect(),
+            ..seg(start, end, &text)
+        }
+    }
+
+    fn same_time(t: f64, n: usize) -> Vec<(&'static str, f64, f64)> {
+        vec![("word", t, t); n]
+    }
+
+    #[test]
+    fn collapsed_runs_match_the_contract_examples() {
+        assert_eq!(
+            collapsed_runs(&[timed(&same_time(5.0, 10))]),
+            vec![(5.0, 10)]
+        );
+        assert!(collapsed_runs(&[timed(&same_time(5.0, 7))]).is_empty());
+        let spaced: Vec<_> = (0..20)
+            .map(|k| {
+                let s = k as f64 * 0.3;
+                ("word", s, s + 0.25)
+            })
+            .collect();
+        assert!(collapsed_runs(&[timed(&spaced)]).is_empty());
+        let mut words: Vec<(&str, f64, f64)> =
+            (0..5).map(|k| ("ok", k as f64, k as f64 + 0.5)).collect();
+        words.extend(same_time(5.0, 9));
+        words.extend((6..9).map(|k| ("ok", k as f64, k as f64 + 0.5)));
+        assert_eq!(collapsed_runs(&[timed(&words)]), vec![(5.0, 9)]);
+    }
+
+    #[test]
+    fn collapsed_runs_keep_a_span_of_exactly_a_tenth_and_drop_anything_longer() {
+        let edge: Vec<_> = (0..8).map(|_| ("edge", 5.0, 5.1)).collect();
+        assert_eq!(collapsed_runs(&[timed(&edge)]), vec![(5.0, 8)]);
+        let mut past: Vec<_> = (0..7).map(|_| ("past", 5.0, 5.1)).collect();
+        past.push(("past", 5.0, 5.11));
+        assert!(collapsed_runs(&[timed(&past)]).is_empty());
+    }
+
+    #[test]
+    fn collapsed_runs_are_maximal_and_cross_segment_boundaries() {
+        assert_eq!(
+            collapsed_runs(&[timed(&same_time(5.0, 16))]),
+            vec![(5.0, 16)]
+        );
+        let two: Vec<_> = same_time(5.0, 8)
+            .into_iter()
+            .chain(same_time(9.0, 8))
+            .collect();
+        assert_eq!(collapsed_runs(&[timed(&two)]), vec![(5.0, 8), (9.0, 8)]);
+        let split = [timed(&same_time(5.0, 4)), timed(&same_time(5.0, 4))];
+        assert_eq!(collapsed_runs(&split), vec![(5.0, 8)]);
+    }
+
+    #[test]
+    fn collapsed_runs_handle_empty_and_huge_input() {
+        assert!(collapsed_runs(&[]).is_empty());
+        assert!(collapsed_runs(&[seg(0.0, 1.0, "no words")]).is_empty());
+        assert_eq!(
+            collapsed_runs(&[timed(&same_time(5.0, 8000))]),
+            vec![(5.0, 8000)]
+        );
+        let spaced: Vec<_> = (0..8000)
+            .map(|k| ("ok", k as f64, k as f64 + 0.5))
+            .collect();
+        assert!(collapsed_runs(&[timed(&spaced)]).is_empty());
+    }
+
+    #[test]
+    fn damage_counts_collapsed_words_and_words_the_guard_drops() {
+        assert_eq!(damage(&[]), 0);
+        let clean = [timed(&[("a", 0.0, 0.5), ("b", 1.0, 1.5)])];
+        assert_eq!(damage(&clean), 0);
+        let repeated: Vec<_> = (0..12).map(|k| ("go", k as f64, k as f64 + 0.5)).collect();
+        assert_eq!(damage(&[timed(&repeated)]), 11, "12 repeats keep one");
+        assert_eq!(damage(&[timed(&same_time(50.0, 8))]), 8);
+        let both = [timed(&repeated), timed(&same_time(50.0, 8))];
+        assert_eq!(damage(&both), 19);
+    }
+
+    #[test]
+    fn drop_collapsed_tail_removes_a_tail_run_and_keeps_normal_words() {
+        let normal: Vec<(&str, f64, f64)> =
+            (0..20).map(|k| ("ok", k as f64, k as f64 + 0.5)).collect();
+        let segs = vec![timed(&normal), timed(&same_time(19.9, 27))];
+        let (out, n) = drop_collapsed_tail(segs, 20.0);
+        assert_eq!(n, 27);
+        assert_eq!(out, vec![timed(&normal)]);
+    }
+
+    #[test]
+    fn drop_collapsed_tail_keeps_a_run_before_the_tail_window() {
+        let segs = vec![timed(&same_time(10.0, 27))];
+        let (out, n) = drop_collapsed_tail(segs.clone(), 20.0);
+        assert_eq!(n, 0);
+        assert_eq!(out, segs);
+    }
+
+    #[test]
+    fn drop_collapsed_tail_rebuilds_the_text_of_a_partly_dropped_segment() {
+        let mut words: Vec<(&str, f64, f64)> =
+            vec![("one", 1.0, 1.5), ("two", 2.0, 2.5), ("three", 3.0, 3.5)];
+        words.extend(same_time(19.9, 27));
+        let mut mixed = timed(&words);
+        mixed.text = format!(" {}", mixed.text);
+        let (out, n) = drop_collapsed_tail(vec![mixed], 20.0);
+        assert_eq!(n, 27);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, " one two three", "leading space kept");
+        assert_eq!(out[0].end, 3.5, "end is the last kept word's end");
+        assert_eq!(out[0].words.len(), 3);
     }
 }
