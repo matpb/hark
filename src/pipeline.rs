@@ -855,6 +855,18 @@ mod tests {
     }
 
     #[test]
+    fn guard_collapses_the_live_dictation_loop() {
+        let looped = " et moi, c'est un école de travail. C'est un école de travail. C'est un école de travail.";
+        let (out, reps) = guard_repetitions(vec![seg(0.0, 21.6, looped)]);
+        assert_eq!(reps.len(), 1, "{reps:?}");
+        assert_eq!(
+            (reps[0].count, reps[0].phrase_words, reps[0].dropped_words),
+            (3, 5, 10)
+        );
+        assert_eq!(out[0].text, " et moi, c'est un école de travail.");
+    }
+
+    #[test]
     fn guard_leaves_two_copies_of_a_seven_word_phrase_alone() {
         let phrase = " et moi, c'est un école de travail.";
         let segs = vec![seg(0.0, 3.0, phrase), seg(3.0, 6.0, phrase)];
