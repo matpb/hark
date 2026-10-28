@@ -359,7 +359,7 @@ pub fn mean_logprob(tokens: &[TokenInfo], eot: i32) -> f64 {
 
 const REPEAT_MAX_PHRASE_WORDS: usize = 12;
 const REPEAT_MIN_COUNT: [usize; REPEAT_MAX_PHRASE_WORDS + 1] =
-    [0, 10, 8, 6, 5, 5, 4, 4, 4, 4, 4, 4, 4];
+    [0, 10, 8, 6, 5, 3, 3, 3, 3, 3, 3, 3, 3];
 
 /// One collapsed repetition run; the phrase text is deliberately not kept.
 #[derive(Debug, Clone, PartialEq)]
@@ -829,6 +829,90 @@ mod tests {
         let (_, reps) = guard_repetitions(words_to_segments(&"[: ".repeat(31)));
         assert_eq!(reps.len(), 1);
         assert_eq!(reps[0].count, 31);
+    }
+
+    #[test]
+    fn guard_collapses_three_copies_of_a_seven_word_phrase() {
+        let phrase = " et moi, c'est un école de travail.";
+        let segs = vec![
+            seg(0.0, 3.0, phrase),
+            seg(3.0, 6.0, phrase),
+            seg(6.0, 9.0, phrase),
+        ];
+        let (out, reps) = guard_repetitions(segs);
+        assert_eq!(
+            reps,
+            vec![RepetitionReport {
+                count: 3,
+                phrase_words: 7,
+                dropped_words: 14,
+                start: 0.0,
+                end: 9.0,
+            }]
+        );
+        let joined: String = out.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(joined, " et moi, c'est un école de travail.");
+    }
+
+    #[test]
+    fn guard_leaves_two_copies_of_a_seven_word_phrase_alone() {
+        let phrase = " et moi, c'est un école de travail.";
+        let segs = vec![seg(0.0, 3.0, phrase), seg(3.0, 6.0, phrase)];
+        let (out, reps) = guard_repetitions(segs.clone());
+        assert!(reps.is_empty(), "{reps:?}");
+        assert_eq!(out, segs);
+    }
+
+    #[test]
+    fn guard_leaves_three_copies_of_a_four_word_phrase_alone() {
+        let phrase = " je pense que oui";
+        let segs = vec![
+            seg(0.0, 1.0, phrase),
+            seg(1.0, 2.0, phrase),
+            seg(2.0, 3.0, phrase),
+        ];
+        let (out, reps) = guard_repetitions(segs.clone());
+        assert!(reps.is_empty(), "{reps:?}");
+        assert_eq!(out, segs);
+    }
+
+    #[test]
+    fn four_word_phrases_still_need_five_copies() {
+        let (_, reps) = guard_repetitions(words_to_segments(&"je pense que oui ".repeat(4)));
+        assert!(reps.is_empty(), "{reps:?}");
+        let (_, reps) = guard_repetitions(words_to_segments(&"je pense que oui ".repeat(5)));
+        assert_eq!(reps.len(), 1);
+        assert_eq!(reps[0].count, 5);
+        assert_eq!(reps[0].phrase_words, 4);
+        assert_eq!(reps[0].dropped_words, 16);
+    }
+
+    #[test]
+    fn guard_collapses_three_copies_of_a_five_word_phrase() {
+        let text = "alpha bravo charlie delta echo ".repeat(3);
+        let (_, reps) = guard_repetitions(words_to_segments(&text));
+        assert_eq!(reps.len(), 1);
+        assert_eq!(reps[0].count, 3);
+        assert_eq!(reps[0].phrase_words, 5);
+        assert_eq!(reps[0].dropped_words, 10);
+    }
+
+    #[test]
+    fn guard_collapses_three_copies_of_a_twelve_word_phrase() {
+        let phrase = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima ";
+        let (_, reps) = guard_repetitions(words_to_segments(&phrase.repeat(3)));
+        assert_eq!(reps.len(), 1);
+        assert_eq!(reps[0].count, 3);
+        assert_eq!(reps[0].phrase_words, 12);
+        assert_eq!(reps[0].dropped_words, 24);
+    }
+
+    #[test]
+    fn guard_leaves_three_copies_of_a_thirteen_word_phrase_alone() {
+        let phrase =
+            "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike ";
+        let (_, reps) = guard_repetitions(words_to_segments(&phrase.repeat(3)));
+        assert!(reps.is_empty(), "{reps:?}");
     }
 
     #[test]
