@@ -362,6 +362,8 @@ const REPEAT_MIN_COUNT: [usize; REPEAT_MAX_PHRASE_WORDS + 1] =
     [0, 10, 8, 6, 5, 3, 3, 3, 3, 3, 3, 3, 3];
 /// Minimum words in a run whose timestamps all fall inside COLLAPSED_SPAN_SECS.
 pub const COLLAPSED_MIN_WORDS: usize = 8;
+/// Collapsed words that trigger a repair re-decode; the repair is kept only if the damage drops.
+pub const COLLAPSED_REPAIR_MIN_WORDS: usize = 3;
 pub const COLLAPSED_SPAN_SECS: f64 = 0.1;
 /// Collapsed runs starting within this many seconds of the chunk end are dropped, not re-decoded.
 pub const COLLAPSED_TAIL_SECS: f64 = 1.0;
@@ -495,8 +497,9 @@ fn clamped_times(segments: &[Segment]) -> Vec<(f64, f64)> {
         .collect()
 }
 
-/// (first word index, word count) of each maximal collapsed run in `times`.
-fn collapsed_index_runs(times: &[(f64, f64)]) -> Vec<(usize, usize)> {
+/// (first word index, word count) of each maximal run of >= `min_words` collapsed words.
+fn collapsed_index_runs(segments: &[Segment], min_words: usize) -> Vec<(usize, usize)> {
+    let times = clamped_times(segments);
     let mut runs = Vec::new();
     let mut i = 0;
     while i < times.len() {
@@ -506,7 +509,7 @@ fn collapsed_index_runs(times: &[(f64, f64)]) -> Vec<(usize, usize)> {
             j += 1;
         }
         let count = j - i;
-        if count >= COLLAPSED_MIN_WORDS {
+        if count >= min_words {
             runs.push((i, count));
             i = j;
         } else {
@@ -516,11 +519,11 @@ fn collapsed_index_runs(times: &[(f64, f64)]) -> Vec<(usize, usize)> {
     runs
 }
 
-/// (start, word count) of each maximal run of >= COLLAPSED_MIN_WORDS words spanning <= COLLAPSED_SPAN_SECS.
+/// (start, word count) of each maximal run of >= `min_words` words spanning <= COLLAPSED_SPAN_SECS.
 /// Times are clamped forward as in `finalize_segments`, so words that jump back count as collapsed.
-pub fn collapsed_runs(segments: &[Segment]) -> Vec<(f64, usize)> {
+pub fn collapsed_runs(segments: &[Segment], min_words: usize) -> Vec<(f64, usize)> {
     let times = clamped_times(segments);
-    collapsed_index_runs(&times)
+    collapsed_index_runs(segments, min_words)
         .into_iter()
         .map(|(i, n)| (times[i].0, n))
         .collect()
@@ -533,7 +536,7 @@ pub fn drop_collapsed_tail(segments: Vec<Segment>, chunk_end: f64) -> (Vec<Segme
     let tail_start = chunk_end - COLLAPSED_TAIL_SECS;
     let mut dropped = vec![false; times.len()];
     let mut removed = 0;
-    for (first, count) in collapsed_index_runs(&times) {
+    for (first, count) in collapsed_index_runs(&segments, COLLAPSED_MIN_WORDS) {
         if times[first].0 >= tail_start {
             dropped[first..first + count].fill(true);
             removed += count;
@@ -578,7 +581,10 @@ pub fn drop_collapsed_tail(segments: Vec<Segment>, chunk_end: f64) -> (Vec<Segme
 
 /// Words inside collapsed runs plus words dropped by the repetition guard.
 pub fn damage(segments: &[Segment]) -> usize {
-    let collapsed: usize = collapsed_runs(segments).iter().map(|(_, n)| n).sum();
+    let collapsed: usize = collapsed_runs(segments, COLLAPSED_REPAIR_MIN_WORDS)
+        .iter()
+        .map(|(_, n)| n)
+        .sum();
     let (_, reports) = guard_repetitions(segments.to_vec());
     let dropped: usize = reports.iter().map(|r| r.dropped_words).sum();
     collapsed + dropped
@@ -1241,61 +1247,74 @@ mod tests {
 
     #[test]
     fn collapsed_runs_match_the_contract_examples() {
+        let m = COLLAPSED_MIN_WORDS;
         assert_eq!(
-            collapsed_runs(&[timed(&same_time(5.0, 10))]),
+            collapsed_runs(&[timed(&same_time(5.0, 10))], m),
             vec![(5.0, 10)]
         );
-        assert!(collapsed_runs(&[timed(&same_time(5.0, 7))]).is_empty());
+        assert!(collapsed_runs(&[timed(&same_time(5.0, 7))], m).is_empty());
         let spaced: Vec<_> = (0..20)
             .map(|k| {
                 let s = k as f64 * 0.3;
                 ("word", s, s + 0.25)
             })
             .collect();
-        assert!(collapsed_runs(&[timed(&spaced)]).is_empty());
+        assert!(collapsed_runs(&[timed(&spaced)], m).is_empty());
         let mut words: Vec<(&str, f64, f64)> =
             (0..5).map(|k| ("ok", k as f64, k as f64 + 0.5)).collect();
         words.extend(same_time(5.0, 9));
         words.extend((6..9).map(|k| ("ok", k as f64, k as f64 + 0.5)));
-        assert_eq!(collapsed_runs(&[timed(&words)]), vec![(5.0, 9)]);
+        assert_eq!(collapsed_runs(&[timed(&words)], m), vec![(5.0, 9)]);
     }
 
     #[test]
     fn collapsed_runs_keep_a_span_of_exactly_a_tenth_and_drop_anything_longer() {
+        let m = COLLAPSED_MIN_WORDS;
         let edge: Vec<_> = (0..8).map(|_| ("edge", 5.0, 5.1)).collect();
-        assert_eq!(collapsed_runs(&[timed(&edge)]), vec![(5.0, 8)]);
+        assert_eq!(collapsed_runs(&[timed(&edge)], m), vec![(5.0, 8)]);
         let mut past: Vec<_> = (0..7).map(|_| ("past", 5.0, 5.1)).collect();
         past.push(("past", 5.0, 5.11));
-        assert!(collapsed_runs(&[timed(&past)]).is_empty());
+        assert!(collapsed_runs(&[timed(&past)], m).is_empty());
     }
 
     #[test]
     fn collapsed_runs_are_maximal_and_cross_segment_boundaries() {
+        let m = COLLAPSED_MIN_WORDS;
         assert_eq!(
-            collapsed_runs(&[timed(&same_time(5.0, 16))]),
+            collapsed_runs(&[timed(&same_time(5.0, 16))], m),
             vec![(5.0, 16)]
         );
         let two: Vec<_> = same_time(5.0, 8)
             .into_iter()
             .chain(same_time(9.0, 8))
             .collect();
-        assert_eq!(collapsed_runs(&[timed(&two)]), vec![(5.0, 8), (9.0, 8)]);
+        assert_eq!(collapsed_runs(&[timed(&two)], m), vec![(5.0, 8), (9.0, 8)]);
         let split = [timed(&same_time(5.0, 4)), timed(&same_time(5.0, 4))];
-        assert_eq!(collapsed_runs(&split), vec![(5.0, 8)]);
+        assert_eq!(collapsed_runs(&split, m), vec![(5.0, 8)]);
     }
 
     #[test]
     fn collapsed_runs_handle_empty_and_huge_input() {
-        assert!(collapsed_runs(&[]).is_empty());
-        assert!(collapsed_runs(&[seg(0.0, 1.0, "no words")]).is_empty());
+        let m = COLLAPSED_MIN_WORDS;
+        assert!(collapsed_runs(&[], m).is_empty());
+        assert!(collapsed_runs(&[seg(0.0, 1.0, "no words")], m).is_empty());
         assert_eq!(
-            collapsed_runs(&[timed(&same_time(5.0, 8000))]),
+            collapsed_runs(&[timed(&same_time(5.0, 8000))], m),
             vec![(5.0, 8000)]
         );
         let spaced: Vec<_> = (0..8000)
             .map(|k| ("ok", k as f64, k as f64 + 0.5))
             .collect();
-        assert!(collapsed_runs(&[timed(&spaced)]).is_empty());
+        assert!(collapsed_runs(&[timed(&spaced)], m).is_empty());
+    }
+
+    #[test]
+    fn collapsed_runs_take_the_minimum_as_an_argument() {
+        assert_eq!(
+            collapsed_runs(&[timed(&same_time(5.0, 3))], COLLAPSED_REPAIR_MIN_WORDS),
+            vec![(5.0, 3)]
+        );
+        assert!(collapsed_runs(&[timed(&same_time(5.0, 3))], COLLAPSED_MIN_WORDS).is_empty());
     }
 
     #[test]
@@ -1325,6 +1344,14 @@ mod tests {
         let segs = vec![timed(&same_time(10.0, 27))];
         let (out, n) = drop_collapsed_tail(segs.clone(), 20.0);
         assert_eq!(n, 0);
+        assert_eq!(out, segs);
+    }
+
+    #[test]
+    fn drop_collapsed_tail_keeps_a_seven_word_tail_run() {
+        let segs = vec![timed(&same_time(19.9, 7))];
+        let (out, n) = drop_collapsed_tail(segs.clone(), 20.0);
+        assert_eq!(n, 0, "tail drops need {COLLAPSED_MIN_WORDS} words");
         assert_eq!(out, segs);
     }
 

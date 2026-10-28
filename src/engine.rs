@@ -1291,7 +1291,7 @@ const REPAIR_ENTROPY_THOLD: f32 = 2.9;
 pub fn repair_start(segments: &[Segment], chunk_start_secs: f64) -> Option<f64> {
     let (_, reports) = pipeline::guard_repetitions(segments.to_vec());
     let repeats = reports.iter().map(|r| r.start);
-    let collapsed = pipeline::collapsed_runs(segments)
+    let collapsed = pipeline::collapsed_runs(segments, pipeline::COLLAPSED_REPAIR_MIN_WORDS)
         .into_iter()
         .map(|(start, _)| start);
     let earliest = repeats.chain(collapsed).reduce(f64::min)?;
@@ -1747,8 +1747,18 @@ mod tests {
                 .map(|(k, w)| (*w, k as f64, k as f64 + 0.5))
                 .collect();
         assert_eq!(repair_start(&[seg_with_words(&words)], 0.0), None);
-        let seven: Vec<(&str, f64, f64)> = (0..7).map(|_| ("x", 300.0, 300.0)).collect();
-        assert_eq!(repair_start(&[seg_with_words(&seven)], 0.0), None);
+        let two: Vec<(&str, f64, f64)> = (0..2).map(|_| ("x", 300.0, 300.0)).collect();
+        assert_eq!(repair_start(&[seg_with_words(&two)], 0.0), None);
+    }
+
+    #[test]
+    fn repair_fires_on_three_words_at_one_instant() {
+        let three = seg_with_words(&[
+            ("one", 300.0, 300.0),
+            ("two", 300.0, 300.0),
+            ("three", 300.0, 300.0),
+        ]);
+        assert_eq!(repair_start(&[three], 240.0), Some(299.5));
     }
 
     #[test]
