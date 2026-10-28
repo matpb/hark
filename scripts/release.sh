@@ -46,6 +46,9 @@ MAC_HOST="${HARK_RELEASE_MAC_HOST:-}"
 WIN_HOST="${HARK_RELEASE_WIN_HOST:-}"
 WIN_DIR="${HARK_RELEASE_WIN_DIR:-}"
 LINUX_IMAGE_BASE="debian:12"
+VULKAN_SDK_VERSION="1.4.363.0"
+VULKAN_SDK_URL="https://sdk.lunarg.com/sdk/download/$VULKAN_SDK_VERSION/linux/vulkansdk-linux-x86_64-$VULKAN_SDK_VERSION.tar.xz"
+VULKAN_SDK_SHA256="197962f5cbf80baf2775a03336a01cee7c8745686c65aaa70d3f751ade4d7e43"
 SMOKE_IMAGE="ubuntu:22.04"
 
 SIGN_IDENTITY="${HARK_RELEASE_SIGN_IDENTITY:-}"
@@ -139,6 +142,24 @@ stage_dir() {
   echo "$d"
 }
 
+# Fails when ggml-vulkan was configured with an old glslc: $1 = label, $2 = target/release/build dir holding whisper-rs-sys-*/output.
+check_glslc() {
+  local label="$1" bdir="$2" out="" f d
+  for f in "$bdir"/whisper-rs-sys-*/output; do
+    [[ -f "$f" ]] || continue
+    if [[ -z "$out" || "$f" -nt "$out" ]]; then out="$f"; fi
+  done
+  [[ -n "$out" ]] || die "$label: no whisper-rs-sys build output under $bdir"
+  if grep -q 'not supported by glslc' "$out"; then
+    grep 'not supported by glslc' "$out" | sort -u >&2
+    die "$label: glslc is too old, the build lacks Vulkan shader extensions"
+  fi
+  for d in BFLOAT16 COOPMAT2 COOPMAT INTEGER_DOT; do
+    grep -q -- "-DGGML_VULKAN_${d}_GLSLC_SUPPORT" "$out" || die "$label: -DGGML_VULKAN_${d}_GLSLC_SUPPORT missing from the build"
+  done
+  echo "$label: glslc gate ok (bfloat16, coopmat2, coopmat, integer-dot defines present)"
+}
+
 summary=()
 sums=()
 
@@ -149,18 +170,27 @@ build_linux() {
   mkdir -p "$cache/cargo" "$cache/target" "$cache/src"
   cat > "$cache/Containerfile" <<EOF
 FROM $LINUX_IMAGE_BASE
-ENV DEBIAN_FRONTEND=noninteractive RUSTUP_HOME=/opt/rustup PATH=/opt/cargo/bin:\$PATH CPATH=/opt/vkheaders/include
+ENV DEBIAN_FRONTEND=noninteractive RUSTUP_HOME=/opt/rustup PATH=/opt/vksdk/bin:/opt/cargo/bin:\$PATH CPATH=/opt/vksdk/include
 RUN apt-get update && apt-get install -y --no-install-recommends \\
-      ca-certificates curl build-essential cmake pkg-config git libclang-dev \\
-      libvulkan-dev glslc \\
+      ca-certificates curl xz-utils build-essential cmake pkg-config git libclang-dev \\
+      libvulkan-dev \\
     && rm -rf /var/lib/apt/lists/*
-# Debian 12 ships Vulkan headers 1.3.239; ggml needs VK_EXT_layer_settings (1.3.261+), so newer headers go first on CPATH.
-RUN git clone -q --depth 1 --branch v1.3.296 https://github.com/KhronosGroup/Vulkan-Headers /tmp/vh \\
-    && mkdir -p /opt/vkheaders && cp -r /tmp/vh/include /opt/vkheaders/include && rm -rf /tmp/vh
+# Debian 12's glslc lacks the bfloat16, coopmat and integer-dot extensions and its headers are 1.3.239 (ggml needs 1.3.261+).
+# The pinned LunarG SDK supplies glslc and headers; its glslc needs only glibc 2.34 and GLIBCXX 3.4.29, so it runs here.
+RUN curl -fsSL -o /tmp/sdk.tar.xz $VULKAN_SDK_URL \\
+    && echo "$VULKAN_SDK_SHA256  /tmp/sdk.tar.xz" | sha256sum -c - \\
+    && mkdir -p /opt/vksdk /tmp/sdkx \\
+    && tar -xJf /tmp/sdk.tar.xz -C /tmp/sdkx --strip-components=2 $VULKAN_SDK_VERSION/x86_64/bin/glslc $VULKAN_SDK_VERSION/x86_64/include \\
+    && cp -r /tmp/sdkx/bin /tmp/sdkx/include /opt/vksdk/ && rm -rf /tmp/sdk.tar.xz /tmp/sdkx && glslc --version
 RUN CARGO_HOME=/opt/cargo curl -fsSL https://sh.rustup.rs | CARGO_HOME=/opt/cargo sh -s -- -y --profile minimal --default-toolchain stable
 EOF
   local img="hark-release-linux:$(sha256sum "$cache/Containerfile" | cut -c1-12)"
   podman image exists "$img" || podman build -q -t "$img" -f "$cache/Containerfile" "$cache" >/dev/null
+  # The cached target must not keep a whisper-rs-sys built with another toolchain image.
+  if [[ "$(cat "$cache/target/.image" 2>/dev/null)" != "$img" ]]; then
+    rm -rf "$cache"/target/release/build/whisper-rs-sys-* "$cache"/target/release/.fingerprint/whisper-rs-sys-*
+    echo "$img" > "$cache/target/.image"
+  fi
   # rsync by checksum without times keeps unchanged files' mtimes, so cargo reuses the cached build.
   local tmp; tmp="$(mktemp -d "$work/linux-src.XXXXXX")"
   git archive "$src_ref" | tar -x -C "$tmp"
@@ -170,6 +200,7 @@ EOF
     -v "$cache/src:/src:ro" -v "$cache/cargo:/cache/cargo" -v "$cache/target:/cache/target" \
     -e CARGO_HOME=/cache/cargo -e CARGO_TARGET_DIR=/cache/target -w /src \
     "$img" cargo build --release --features vulkan --locked
+  check_glslc "linux" "$cache/target/release/build"
   cp "$cache/target/release/hark" "$work/hark-linux"
   glibc_max="$(objdump -T "$work/hark-linux" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)"
   glibcxx_max="$(objdump -T "$work/hark-linux" | grep -o 'GLIBCXX_[0-9.]*' | sed 's/GLIBCXX_//' | sort -V | tail -1)"
@@ -253,6 +284,7 @@ build_windows() {
   (( snapshot )) && echo "warning: windows build uses the working tree, which includes the uncommitted changes"
   local exe; exe="$(scripts/build-windows.sh | tail -1)"
   [[ -f "$exe" ]] || die "windows build produced no exe"
+  check_glslc "windows" "$root/target/x86_64-pc-windows-msvc/release/build"
   [[ "$(git rev-parse HEAD)" == "$commit" ]] || die "HEAD moved during the build"
   local d; d="$(stage_dir x86_64-windows "$exe:hark.exe" scripts/install-windows.ps1:scripts/install-windows.ps1 \
     scripts/config.example.toml:scripts/config.example.toml README.md:README.md)"
