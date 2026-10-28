@@ -847,7 +847,6 @@ pub struct WhisperEngine<B: Backend = WhisperBackend> {
     vad_default: bool,
     vad: VadPool<Box<WhisperVadContext>>,
     vad_failed: AtomicBool,
-    cpu_threads: i32,
 }
 
 struct VadConfig {
@@ -899,7 +898,6 @@ impl WhisperEngine {
             vad_default: vad.default,
             vad: VadPool::new(),
             vad_failed: AtomicBool::new(false),
-            cpu_threads,
         }
     }
 
@@ -950,7 +948,6 @@ impl<B: Backend> WhisperEngine<B> {
             vad_default: false,
             vad: VadPool::new(),
             vad_failed: AtomicBool::new(false),
-            cpu_threads: 1,
         }
     }
 
@@ -984,7 +981,8 @@ impl<B: Backend> WhisperEngine<B> {
                 let _guard = GGML_INIT.lock().unwrap_or_else(|p| p.into_inner());
                 let mut params = WhisperVadContextParams::new();
                 params.set_use_gpu(false);
-                params.set_n_threads(self.cpu_threads);
+                // Silero's graph is tiny; extra threads spin on ggml barriers and stall concurrent requests.
+                params.set_n_threads(1);
                 match path
                     .to_str()
                     .filter(|p| !p.contains('\0'))
