@@ -218,7 +218,7 @@ hark falls back to CPU when the GPU runs out of memory, during a run or while lo
 | `dir` | the models path in the table above (`~/.local/share/hark/models` on Linux) | Writable directory for `hark models pull`. |
 | `extra_dirs` | the Wspr dictation app's models folder (`~/.config/Wspr/models` on Linux) | Read-only directories searched for existing ggml files. Set it to `[]` or your own folders if you do not use Wspr. |
 
-`[models.word_timestamps]` maps a model id to `"dtw"` or `"heuristic"` (default: `"large-v3-turbo" = "dtw"`). DTW gives better word times and needs an alignment preset, so it only works for models hark knows (tiny through large-v3-turbo and their `.en` variants).
+`[models.word_timestamps]` maps a model id to `"dtw"` or `"heuristic"`. Every model with a DTW alignment preset (tiny through large-v3-turbo and their `.en` variants) uses DTW unless it is set to `"heuristic"`; other models use heuristic timings. DTW gives better word times and turns off flash attention, so `"heuristic"` decodes faster.
 
 `[aliases]` maps extra model names to catalog ids. `whisper-1` always follows `engine.default_model` unless you override it here.
 
@@ -341,7 +341,7 @@ All need the bearer key when one is set.
 | Route | Does |
 |---|---|
 | `GET /health` | `{"status": "ok" or "degraded", "version"}`; no key needed. |
-| `GET /hark/v1/status` | Device, loaded models, VRAM per state, queue depth per lane, running work, last error, realtime factor. |
+| `GET /hark/v1/status` | Device, loaded models, the default model `whisper-1` resolves to, VRAM per state, queue depth per lane, running work, last error, realtime factor. |
 | `GET /hark/v1/models` | Catalog with installed and loaded flags. |
 | `POST /hark/v1/models/pull` | `{"id": "large-v3-turbo"}`; downloads to `models.dir` and verifies the pinned SHA-256. |
 | `POST /hark/v1/models/{id}/load` | Load now. |

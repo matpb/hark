@@ -31,7 +31,7 @@ dir = "~/.local/share/hark/models"
 extra_dirs = ["~/.config/Wspr/models"]   # read-only; hark never writes or deletes here
 
 [models.word_timestamps]
-"large-v3-turbo" = "dtw"         # dtw | heuristic
+"large-v3-turbo" = "dtw"         # dtw | heuristic; models with a preset default to dtw
 
 [aliases]
 # "whisper-1" follows engine.default_model unless set here, for example:

@@ -1,6 +1,6 @@
 [package]
 name = "hark"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2024"
 description = "Local OpenAI-compatible transcription daemon (whisper.cpp via whisper-rs)"
 license = "MIT"

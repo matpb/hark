@@ -486,9 +486,10 @@ impl WhisperBackend {
             .word_timestamps
             .get(id)
             .or_else(|| self.word_timestamps.get(crate::models::base_model_id(id)));
+        // No entry means DTW wherever a preset exists: heuristic timings put words outside speech.
         match mode.map(String::as_str) {
-            Some("dtw") => dtw_preset(id),
-            _ => None,
+            Some("heuristic") => None,
+            _ => dtw_preset(id),
         }
     }
 
@@ -804,17 +805,40 @@ impl Backend for WhisperBackend {
         let Some(st) = guard.as_mut() else {
             return Err(ChunkFailure::Failed("state was retired".into()));
         };
-        let audio = &task.audio[task.span.start..task.span.end];
-        match decode_chunk(
-            &loaded,
-            st,
-            audio,
-            task.span.start,
-            &task.opts,
-            task.language.as_deref(),
-            self.cpu_threads,
-            abort,
-        ) {
+        // Compacted decodes run at offset 0; seek_cs still reports the original span start.
+        let decoded = if task.pieces.len() >= 2 {
+            let compacted = pipeline::compact(&task.audio, &task.pieces);
+            decode_chunk(
+                &loaded,
+                st,
+                &compacted.audio,
+                0,
+                &task.opts,
+                task.language.as_deref(),
+                self.cpu_threads,
+                abort,
+            )
+            .map(|mut out| {
+                out.segments = pipeline::remap_segments(out.segments, &compacted.map, 0.0);
+                for seg in &mut out.segments {
+                    seg.seek_cs = (task.span.start / 160) as i64;
+                }
+                out
+            })
+        } else {
+            let audio = &task.audio[task.span.start..task.span.end];
+            decode_chunk(
+                &loaded,
+                st,
+                audio,
+                task.span.start,
+                &task.opts,
+                task.language.as_deref(),
+                self.cpu_threads,
+                abort,
+            )
+        };
+        match decoded {
             Ok(out) => Ok(out),
             Err(DecodeFailure::Aborted) => Err(ChunkFailure::Aborted),
             Err(DecodeFailure::Whisper(WhisperError::GenericError(-7))) => {
@@ -1112,6 +1136,7 @@ impl<B: Backend> Transcriber for WhisperEngine<B> {
             task: ChunkTask {
                 audio: chunk.audio.clone(),
                 span: chunk.span,
+                pieces: Arc::new(Vec::new()),
                 opts: chunk.opts.clone(),
                 language: chunk.language.clone(),
             },
@@ -1156,6 +1181,7 @@ impl<B: Backend> Transcriber for WhisperEngine<B> {
         let mut run_secs = 0.0f64;
         let mut queue_wait = 0.0f64;
         let mut run = |span: Span,
+                       pieces: Vec<Span>,
                        last: bool,
                        segments: &mut Vec<Segment>|
          -> Result<ChunkOut, EngineError> {
@@ -1171,6 +1197,7 @@ impl<B: Backend> Transcriber for WhisperEngine<B> {
                 task: ChunkTask {
                     audio: req.audio.clone(),
                     span,
+                    pieces: Arc::new(pieces),
                     opts: shared_opts.clone(),
                     language: used.clone(),
                 },
@@ -1191,10 +1218,10 @@ impl<B: Backend> Transcriber for WhisperEngine<B> {
         };
         match regions {
             Some(regions) => {
-                let plan = pipeline::plan_vad_chunks(&regions, audio.len());
+                let plan = pipeline::plan_vad_chunks_compacted(&regions, audio.len());
                 let n = plan.len();
-                for (i, span) in plan.into_iter().enumerate() {
-                    run(span, i + 1 == n, &mut segments)?;
+                for (i, (span, pieces)) in plan.into_iter().enumerate() {
+                    run(span, pieces, i + 1 == n, &mut segments)?;
                 }
             }
             None => {
@@ -1208,7 +1235,7 @@ impl<B: Backend> Transcriber for WhisperEngine<B> {
                     };
                     let span = Span { start: cursor, end };
                     let mut chunk_segments = Vec::new();
-                    run(span, is_last, &mut chunk_segments)?;
+                    run(span, Vec::new(), is_last, &mut chunk_segments)?;
                     let advance = pipeline::plan_advance(
                         &mut chunk_segments,
                         cursor as f64 / f64::from(crate::audio::SAMPLE_RATE),

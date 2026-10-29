@@ -14,6 +14,8 @@ pub const MIN_CHUNK: usize = SR;
 pub const MIN_ADVANCE: usize = 30 * SR;
 const VAD_PAD: usize = SR / 5;
 const VAD_MERGE_GAP: usize = 2 * SR;
+/// Kept audio from each side of a compacted gap, in samples (0.2 s).
+pub const GAP_KEEP: usize = SR / 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Word {
@@ -123,9 +125,8 @@ pub fn build_initial_prompt(
     (!prompt.is_empty()).then_some(prompt)
 }
 
-/// VAD regions (centiseconds) to chunks: pad 200 ms, merge gaps under 2 s, split regions
-/// over 120 s, group up to 120 s; chunks under 1 s are widened (audio under 1 s plans nothing).
-pub fn plan_vad_chunks(regions_cs: &[(f32, f32)], total: usize) -> Vec<Span> {
+/// Padded, merged and split VAD regions (centiseconds) as sorted, disjoint spans.
+fn vad_pieces(regions_cs: &[(f32, f32)], total: usize) -> Vec<Span> {
     let to_samples = |cs: f32| ((cs.max(0.0) as f64) * 160.0) as usize;
     let mut regions: Vec<Span> = regions_cs
         .iter()
@@ -165,26 +166,67 @@ pub fn plan_vad_chunks(regions_cs: &[(f32, f32)], total: usize) -> Vec<Span> {
             end: r.end,
         });
     }
+    pieces
+}
 
-    let mut chunks: Vec<Span> = Vec::new();
-    for p in pieces {
+/// A chunk's outer span (first piece start to last piece end) and the pieces inside it.
+type Group = (Span, Vec<Span>);
+
+/// VAD regions (centiseconds) to chunks: pad 200 ms, merge gaps under 2 s, split regions
+/// over 120 s, group up to 120 s; chunks under 1 s are widened (audio under 1 s plans nothing).
+pub fn plan_vad_chunks(regions_cs: &[(f32, f32)], total: usize) -> Vec<Span> {
+    let mut chunks: Vec<Group> = Vec::new();
+    for p in vad_pieces(regions_cs, total) {
         match chunks.last_mut() {
-            Some(c) if p.end - c.start <= MAX_CHUNK => c.end = p.end,
-            _ => chunks.push(p),
+            Some((c, _)) if p.end - c.start <= MAX_CHUNK => c.end = p.end,
+            _ => chunks.push((p, Vec::new())),
+        }
+    }
+    widen_short_chunks(chunks, total)
+        .into_iter()
+        .map(|(c, _)| c)
+        .collect()
+}
+
+/// Like plan_vad_chunks, but each chunk carries its pieces and is grouped by compacted length <= MAX_CHUNK.
+pub fn plan_vad_chunks_compacted(
+    regions_cs: &[(f32, f32)],
+    total: usize,
+) -> Vec<(Span, Vec<Span>)> {
+    let mut chunks: Vec<Group> = Vec::new();
+    let mut open_len = 0usize;
+    for p in vad_pieces(regions_cs, total) {
+        match chunks.last_mut() {
+            Some((c, members)) if open_len + kept_gap(p.start - c.end) + p.len() <= MAX_CHUNK => {
+                open_len += kept_gap(p.start - c.end) + p.len();
+                c.end = p.end;
+                members.push(p);
+            }
+            _ => {
+                open_len = p.len();
+                chunks.push((p, vec![p]));
+            }
         }
     }
     widen_short_chunks(chunks, total)
 }
 
-/// Centres a 1 s window on each short chunk; a window that would overlap a neighbour is dropped.
-fn widen_short_chunks(chunks: Vec<Span>, total: usize) -> Vec<Span> {
+/// Samples a gap of `gap` samples keeps once compacted.
+fn kept_gap(gap: usize) -> usize {
+    gap.min(2 * GAP_KEEP)
+}
+
+/// Centres a 1 s window on each short chunk, which then carries the window as its only piece;
+/// a window that would overlap a neighbour is dropped.
+fn widen_short_chunks(chunks: Vec<Group>, total: usize) -> Vec<Group> {
     if total < MIN_CHUNK {
         return Vec::new();
     }
-    let mut out: Vec<Span> = Vec::with_capacity(chunks.len());
-    for (i, c) in chunks.iter().enumerate() {
+    let spans: Vec<Span> = chunks.iter().map(|(c, _)| *c).collect();
+    let mut out: Vec<Group> = Vec::with_capacity(chunks.len());
+    for (i, (c, pieces)) in chunks.into_iter().enumerate() {
         if c.len() >= MIN_CHUNK {
-            out.push(*c);
+            out.push((c, pieces));
             continue;
         }
         let start = ((c.start + c.end) / 2)
@@ -194,13 +236,112 @@ fn widen_short_chunks(chunks: Vec<Span>, total: usize) -> Vec<Span> {
             start,
             end: start + MIN_CHUNK,
         };
-        let clear_before = i == 0 || chunks[i - 1].end <= wide.start;
-        let clear_after = chunks.get(i + 1).is_none_or(|n| wide.end <= n.start);
+        let clear_before = i == 0 || spans[i - 1].end <= wide.start;
+        let clear_after = spans.get(i + 1).is_none_or(|n| wide.end <= n.start);
         if clear_before && clear_after {
-            out.push(wide);
+            out.push((wide, vec![wide]));
         }
     }
     out
+}
+
+/// One copied stretch: `len` samples from `orig` placed at `comp` in the compacted chunk.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MapEntry {
+    pub comp: usize,
+    pub orig: usize,
+    pub len: usize,
+}
+
+/// Compacted audio plus the map back to original sample positions.
+pub struct Compacted {
+    pub audio: Vec<f32>,
+    pub map: Vec<MapEntry>,
+}
+
+/// Copies `pieces` (sorted, disjoint, inside `audio`) back to back; a gap of at most
+/// 2 * GAP_KEEP is kept whole, a longer one keeps GAP_KEEP from each side.
+pub fn compact(audio: &[f32], pieces: &[Span]) -> Compacted {
+    let mut out: Vec<f32> = Vec::new();
+    let mut map: Vec<MapEntry> = Vec::new();
+    let mut prev: Option<Span> = None;
+    for &p in pieces {
+        if let Some(q) = prev {
+            let gap = p.start - q.end;
+            if gap <= 2 * GAP_KEEP {
+                copy_stretch(audio, &mut out, &mut map, q.end, gap);
+            } else {
+                copy_stretch(audio, &mut out, &mut map, q.end, GAP_KEEP);
+                copy_stretch(audio, &mut out, &mut map, p.start - GAP_KEEP, GAP_KEEP);
+            }
+        }
+        copy_stretch(audio, &mut out, &mut map, p.start, p.len());
+        prev = Some(p);
+    }
+    Compacted { audio: out, map }
+}
+
+/// Appends `audio[orig..orig + len]` and its map entry; an empty stretch adds nothing.
+fn copy_stretch(
+    audio: &[f32],
+    out: &mut Vec<f32>,
+    map: &mut Vec<MapEntry>,
+    orig: usize,
+    len: usize,
+) {
+    if len == 0 {
+        return;
+    }
+    map.push(MapEntry {
+        comp: out.len(),
+        orig,
+        len,
+    });
+    out.extend_from_slice(&audio[orig..orig + len]);
+}
+
+/// Original time in seconds for a compacted time `t_secs`; monotonic, clamped to the last entry's end.
+pub fn map_time(map: &[MapEntry], t_secs: f64) -> f64 {
+    let Some(last) = map.last() else {
+        return 0.0;
+    };
+    let end = (last.comp + last.len) as f64;
+    // Rounded to the nearest sample so float error at a sample boundary cannot move a timestamp.
+    let x = (t_secs * SR as f64).round().clamp(0.0, end) as usize;
+    let i = map.partition_point(|e| e.comp <= x);
+    let e = map[i.max(1) - 1];
+    (e.orig + x.saturating_sub(e.comp).min(e.len)) as f64 / SR as f64
+}
+
+/// Maps every segment's start/end and every word's start/end through `map_time`, then adds `offset_secs`.
+pub fn remap_segments(segments: Vec<Segment>, map: &[MapEntry], offset_secs: f64) -> Vec<Segment> {
+    let at = |t: f64| map_time(map, t) + offset_secs;
+    segments
+        .into_iter()
+        .map(|s| {
+            let words: Vec<Word> = s
+                .words
+                .into_iter()
+                .map(|w| Word {
+                    start: at(w.start),
+                    end: at(w.end),
+                    ..w
+                })
+                .collect();
+            // A segment edge inside a kept gap maps to the wrong piece; the words bound it instead.
+            let (mut start, mut end) = (at(s.start), at(s.end));
+            if let (Some(first), Some(last)) = (words.first(), words.last()) {
+                start = start.max(first.start);
+                end = end.min(last.end).max(start);
+            }
+            Segment {
+                start,
+                end,
+                words,
+                ..s
+            }
+        })
+        .collect()
 }
 
 /// Static plan for jobs without VAD: back-to-back windows of at most `MAX_CHUNK`, the last
@@ -1368,5 +1509,463 @@ mod tests {
         assert_eq!(out[0].text, " one two three", "leading space kept");
         assert_eq!(out[0].end, 3.5, "end is the last kept word's end");
         assert_eq!(out[0].words.len(), 3);
+    }
+
+    fn ramp(n: usize) -> Vec<f32> {
+        (0..n).map(|i| i as f32).collect()
+    }
+
+    fn span(start: usize, end: usize) -> Span {
+        Span { start, end }
+    }
+
+    /// Compacted length by brute force: piece lengths plus each gap kept up to 2 * GAP_KEEP.
+    fn compacted_len(pieces: &[Span]) -> usize {
+        let mut n = 0;
+        for (i, p) in pieces.iter().enumerate() {
+            n += p.len();
+            if i > 0 {
+                n += (p.start - pieces[i - 1].end).min(2 * GAP_KEEP);
+            }
+        }
+        n
+    }
+
+    fn assert_secs(got: f64, want: f64) {
+        assert!((got - want).abs() < 1e-9, "got {got}, want {want}");
+    }
+
+    fn secs(samples: usize) -> f64 {
+        samples as f64 / SR as f64
+    }
+
+    /// Original sample of compacted sample `c` for the fixture pieces [0, 16000) and
+    /// [80000, 96000) with kept gap sides `k`; an independent statement of the mapping.
+    fn orig_of(c: usize, k: usize) -> usize {
+        let head_end = 16_000 + k;
+        let tail_end = 16_000 + 2 * k;
+        if c < head_end {
+            c
+        } else if c < tail_end {
+            80_000 - k + (c - head_end)
+        } else {
+            80_000 + (c - tail_end)
+        }
+    }
+
+    /// Pieces [0, 1 s) and [5 s, 6 s) of a 6.25 s ramp: a 4 s gap, compacted to 2 * GAP_KEEP.
+    fn long_gap_map() -> Vec<MapEntry> {
+        compact(&ramp(100_000), &[span(0, 16_000), span(80_000, 96_000)]).map
+    }
+
+    #[test]
+    fn compact_keeps_the_head_and_tail_of_a_long_gap() {
+        let k = GAP_KEEP;
+        let audio = ramp(100_000);
+        let c = compact(&audio, &[span(0, 16_000), span(80_000, 96_000)]);
+        assert_eq!(c.audio.len(), 32_000 + 2 * k);
+        assert_eq!(
+            c.map,
+            vec![
+                MapEntry {
+                    comp: 0,
+                    orig: 0,
+                    len: 16_000
+                },
+                MapEntry {
+                    comp: 16_000,
+                    orig: 16_000,
+                    len: k
+                },
+                MapEntry {
+                    comp: 16_000 + k,
+                    orig: 80_000 - k,
+                    len: k
+                },
+                MapEntry {
+                    comp: 16_000 + 2 * k,
+                    orig: 80_000,
+                    len: 16_000
+                },
+            ]
+        );
+        let want: Vec<f32> = (0..16_000)
+            .chain(16_000..16_000 + k)
+            .chain(80_000 - k..80_000)
+            .chain(80_000..96_000)
+            .map(|i| i as f32)
+            .collect();
+        assert_eq!(c.audio, want);
+    }
+
+    #[test]
+    fn compact_keeps_a_short_gap_whole() {
+        let k = GAP_KEEP;
+        let audio = ramp(32_000 + k);
+        let c = compact(&audio, &[span(0, 16_000), span(16_000 + k, 32_000 + k)]);
+        assert_eq!(c.audio.len(), 32_000 + k);
+        assert_eq!(
+            c.map,
+            vec![
+                MapEntry {
+                    comp: 0,
+                    orig: 0,
+                    len: 16_000
+                },
+                MapEntry {
+                    comp: 16_000,
+                    orig: 16_000,
+                    len: k
+                },
+                MapEntry {
+                    comp: 16_000 + k,
+                    orig: 16_000 + k,
+                    len: 16_000
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn compact_switches_to_two_halves_just_past_the_whole_gap_limit() {
+        let k = GAP_KEEP;
+        let audio = ramp(32_001 + 2 * k);
+        let whole = compact(
+            &audio,
+            &[span(0, 16_000), span(16_000 + 2 * k, 32_000 + 2 * k)],
+        );
+        assert_eq!(
+            whole.map.len(),
+            3,
+            "a gap of exactly 2 * GAP_KEEP is kept whole"
+        );
+        assert_eq!(
+            whole.map[1],
+            MapEntry {
+                comp: 16_000,
+                orig: 16_000,
+                len: 2 * k
+            }
+        );
+        let split = compact(
+            &audio,
+            &[span(0, 16_000), span(16_001 + 2 * k, 32_001 + 2 * k)],
+        );
+        assert_eq!(
+            split.map,
+            vec![
+                MapEntry {
+                    comp: 0,
+                    orig: 0,
+                    len: 16_000
+                },
+                MapEntry {
+                    comp: 16_000,
+                    orig: 16_000,
+                    len: k
+                },
+                MapEntry {
+                    comp: 16_000 + k,
+                    orig: 16_001 + k,
+                    len: k
+                },
+                MapEntry {
+                    comp: 16_000 + 2 * k,
+                    orig: 16_001 + 2 * k,
+                    len: 16_000
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn compact_of_one_piece_or_none() {
+        let audio = ramp(50_000);
+        let one = compact(&audio, &[span(1_000, 1_500)]);
+        assert_eq!(
+            one.map,
+            vec![MapEntry {
+                comp: 0,
+                orig: 1_000,
+                len: 500
+            }]
+        );
+        let want: Vec<f32> = (1_000..1_500).map(|i| i as f32).collect();
+        assert_eq!(one.audio, want);
+        let none = compact(&audio, &[]);
+        assert!(none.audio.is_empty() && none.map.is_empty());
+    }
+
+    #[test]
+    fn map_time_matches_the_contract_examples() {
+        let k = GAP_KEEP;
+        let map = long_gap_map();
+        let at = |c: usize| map_time(&map, secs(c));
+        assert_secs(at(0), 0.0);
+        assert_secs(at(SR / 2), 0.5);
+        assert_secs(at(16_000 + k / 2), secs(16_000 + k / 2));
+        assert_secs(at(16_000 + k), secs(80_000 - k));
+        assert_secs(at(16_000 + k + k / 2), secs(80_000 - k + k / 2));
+        assert_secs(at(16_000 + 2 * k + 1_600), 5.1);
+        assert_secs(at(32_000 + 2 * k), 6.0);
+        assert_secs(at(32_000 + 2 * k + SR), 6.0);
+        assert_secs(map_time(&[], 1.0), 0.0);
+        for c in 0..=32_000 + 2 * k {
+            assert_secs(at(c), secs(orig_of(c, k)));
+        }
+    }
+
+    #[test]
+    fn map_time_never_goes_back() {
+        let map = long_gap_map();
+        let mut prev = f64::NEG_INFINITY;
+        for k in 0..=3_000 {
+            let v = map_time(&map, k as f64 * 0.001);
+            assert!(v >= prev, "went back at step {k}: {prev} -> {v}");
+            prev = v;
+        }
+    }
+
+    #[test]
+    fn remap_segments_maps_words_and_keeps_them_monotonic() {
+        let k = GAP_KEEP;
+        // Compacted sample ranges: piece 1, head of the gap, tail of the gap, piece 2.
+        let ranges = [
+            ("a", 8_000, 14_400),
+            ("b", 16_000 + k / 4, 16_000 + k / 2),
+            ("c", 16_000 + k, 16_000 + k + 1_600),
+            ("d", 16_000 + 2 * k + 1_600, 16_000 + 2 * k + 3_200),
+        ];
+        let words: Vec<(&str, f64, f64)> = ranges
+            .iter()
+            .map(|&(w, s, e)| (w, secs(s), secs(e)))
+            .collect();
+        let seg = timed(&words);
+        let out = remap_segments(vec![seg.clone()], &long_gap_map(), 2.0);
+        assert_eq!(out.len(), 1);
+        assert_secs(out[0].start, secs(orig_of(8_000, k)) + 2.0);
+        assert_secs(out[0].end, secs(orig_of(16_000 + 2 * k + 3_200, k)) + 2.0);
+        assert_eq!(out[0].text, seg.text);
+        assert_eq!(out[0].words.len(), ranges.len());
+        for (w, &(word, s, e)) in out[0].words.iter().zip(&ranges) {
+            assert_eq!(w.word, word);
+            assert_secs(w.start, secs(orig_of(s, k)) + 2.0);
+            assert_secs(w.end, secs(orig_of(e, k)) + 2.0);
+        }
+        for pair in out[0].words.windows(2) {
+            assert!(pair[1].start >= pair[0].start);
+            assert!(pair[0].end <= pair[1].start + 1e-9);
+        }
+    }
+
+    #[test]
+    fn remap_segments_bounds_a_segment_by_its_words() {
+        let k = GAP_KEEP;
+        // The raw start sits in the head of the gap; the words sit in piece 2.
+        let raw_start = 16_000 + k / 2;
+        let first = 16_000 + 2 * k + 800;
+        let last_end = 16_000 + 2 * k + 6_000;
+        let bounded = Segment {
+            start: secs(raw_start),
+            end: secs(32_000 + 2 * k),
+            words: vec![
+                Word {
+                    word: "one".into(),
+                    start: secs(first),
+                    end: secs(first + 1_600),
+                },
+                Word {
+                    word: "two".into(),
+                    start: secs(first + 3_200),
+                    end: secs(last_end),
+                },
+            ],
+            ..seg(0.0, 0.0, "")
+        };
+        assert!(
+            secs(orig_of(raw_start, k)) < secs(orig_of(first, k)),
+            "the raw start must map before the first word"
+        );
+        let out = remap_segments(vec![bounded], &long_gap_map(), 0.0);
+        let s = &out[0];
+        assert_eq!(s.words[0].start, secs(orig_of(first, k)));
+        assert_eq!(s.start, s.words[0].start);
+        assert_eq!(s.words[1].end, secs(orig_of(last_end, k)));
+        assert_eq!(
+            s.end, s.words[1].end,
+            "end is the last word's end, not the raw end"
+        );
+
+        let bare = Segment {
+            start: secs(raw_start),
+            end: secs(16_000 + k + k / 2),
+            ..seg(0.0, 0.0, "")
+        };
+        let out = remap_segments(vec![bare], &long_gap_map(), 1.0);
+        assert!(out[0].words.is_empty());
+        assert_secs(out[0].start, secs(orig_of(raw_start, k)) + 1.0);
+        assert_secs(out[0].end, secs(orig_of(16_000 + k + k / 2, k)) + 1.0);
+    }
+
+    #[test]
+    fn remap_segments_handles_a_long_transcript() {
+        let words: Vec<(&str, f64, f64)> = (0..8_000)
+            .map(|k| {
+                let s = k as f64 * 0.0003;
+                ("w", s, s + 0.0002)
+            })
+            .collect();
+        let out = remap_segments(vec![timed(&words)], &long_gap_map(), 0.0);
+        assert_eq!(out[0].words.len(), 8_000);
+        assert!(out[0].words.windows(2).all(|p| p[0].start <= p[1].start));
+    }
+
+    #[test]
+    fn vad_plan_keeps_its_output_for_grouped_regions() {
+        let total = 400 * SR;
+        let regions = [
+            (cs(10.0), cs(20.0)),
+            (cs(100.0), cs(110.0)),
+            (cs(140.0), cs(150.0)),
+            (cs(300.0), cs(310.0)),
+        ];
+        assert_eq!(
+            plan_vad_chunks(&regions, total),
+            vec![
+                span(156_800, 1_763_200),
+                span(2_236_800, 2_403_200),
+                span(4_796_800, 4_963_200),
+            ]
+        );
+    }
+
+    #[test]
+    fn compacted_plan_splits_three_fifty_second_regions_into_two_chunks() {
+        let total = 240 * SR;
+        let regions = [
+            (cs(10.0), cs(60.0)),
+            (cs(90.0), cs(140.0)),
+            (cs(170.0), cs(220.0)),
+        ];
+        let piece = |a: usize, b: usize| span(a * SR - VAD_PAD, b * SR + VAD_PAD);
+        let plan = plan_vad_chunks_compacted(&regions, total);
+        assert_eq!(
+            plan,
+            vec![
+                (
+                    span(10 * SR - VAD_PAD, 140 * SR + VAD_PAD),
+                    vec![piece(10, 60), piece(90, 140)]
+                ),
+                (
+                    span(170 * SR - VAD_PAD, 220 * SR + VAD_PAD),
+                    vec![piece(170, 220)]
+                ),
+            ]
+        );
+        let piece_len = 50 * SR + 2 * VAD_PAD;
+        assert_eq!(compacted_len(&plan[0].1), 2 * piece_len + 2 * GAP_KEEP);
+        assert_eq!(compacted_len(&plan[1].1), piece_len);
+        for (outer, pieces) in &plan {
+            assert!(
+                pieces
+                    .iter()
+                    .all(|p| outer.start <= p.start && p.end <= outer.end)
+            );
+        }
+    }
+
+    #[test]
+    fn compacted_plan_joins_regions_whose_raw_span_exceeds_two_minutes() {
+        let total = 200 * SR;
+        let regions = [(cs(10.0), cs(60.0)), (cs(85.0), cs(135.0))];
+        let plan = plan_vad_chunks_compacted(&regions, total);
+        assert_eq!(
+            plan,
+            vec![(
+                span(10 * SR - VAD_PAD, 135 * SR + VAD_PAD),
+                vec![
+                    span(10 * SR - VAD_PAD, 60 * SR + VAD_PAD),
+                    span(85 * SR - VAD_PAD, 135 * SR + VAD_PAD),
+                ]
+            )]
+        );
+        assert_eq!(
+            plan_vad_chunks(&regions, total).len(),
+            2,
+            "the raw span is 125.4 s"
+        );
+    }
+
+    #[test]
+    fn compacted_plan_keeps_all_pieces_of_a_group_that_fits_compacted() {
+        let total = 400 * SR;
+        let regions = [
+            (cs(10.0), cs(20.0)),
+            (cs(100.0), cs(110.0)),
+            (cs(140.0), cs(150.0)),
+            (cs(300.0), cs(310.0)),
+        ];
+        assert_eq!(
+            plan_vad_chunks_compacted(&regions, total),
+            vec![(
+                span(156_800, 4_963_200),
+                vec![
+                    span(156_800, 323_200),
+                    span(1_596_800, 1_763_200),
+                    span(2_236_800, 2_403_200),
+                    span(4_796_800, 4_963_200),
+                ]
+            )]
+        );
+    }
+
+    #[test]
+    fn compacted_plan_widens_a_short_chunk_into_its_own_piece() {
+        let total = 60 * SR;
+        let regions = [(cs(30.0), cs(30.3))];
+        assert_eq!(
+            plan_vad_chunks_compacted(&regions, total),
+            vec![(span(474_400, 490_400), vec![span(474_400, 490_400)])]
+        );
+        assert_eq!(
+            plan_vad_chunks(&regions, total),
+            vec![span(474_400, 490_400)]
+        );
+    }
+
+    #[test]
+    fn compacted_plan_plans_nothing_without_regions_or_audio() {
+        assert!(plan_vad_chunks_compacted(&[], 10 * SR).is_empty());
+        assert!(plan_vad_chunks_compacted(&[(cs(0.1), cs(0.5))], SR - 1).is_empty());
+        assert!(plan_vad_chunks_compacted(&[(f32::NAN, 5.0)], 10 * SR).is_empty());
+    }
+
+    #[test]
+    fn compacted_plan_fills_each_chunk_to_the_limit_on_a_long_recording() {
+        // Regions of 1 s every 5 s: each piece is 1.4 s and each gap keeps min(gap, 2 * GAP_KEEP).
+        let k = GAP_KEEP;
+        let piece = SR + 2 * VAD_PAD;
+        let kept = (5 * SR - piece).min(2 * k);
+        let per_group = (MAX_CHUNK + kept) / (piece + kept);
+        let regions: Vec<(f32, f32)> = (0..2_000)
+            .map(|i| ((500 * i + 100) as f32, (500 * i + 200) as f32))
+            .collect();
+        let plan = plan_vad_chunks_compacted(&regions, 10_000 * SR);
+        let sizes: Vec<usize> = plan.iter().map(|(_, p)| p.len()).collect();
+        let groups = 2_000usize.div_ceil(per_group);
+        assert_eq!(sizes.len(), groups);
+        assert!(sizes[..groups - 1].iter().all(|&n| n == per_group));
+        assert_eq!(sizes[groups - 1], 2_000 - (groups - 1) * per_group);
+        assert_eq!(sizes.iter().sum::<usize>(), 2_000);
+        assert_eq!(plan[0].0.start, SR - VAD_PAD);
+        assert_eq!(
+            compacted_len(&plan[0].1),
+            per_group * piece + (per_group - 1) * kept
+        );
+        assert!(plan.iter().all(|(_, p)| compacted_len(p) <= MAX_CHUNK));
+        assert!(
+            (per_group + 1) * piece + per_group * kept > MAX_CHUNK,
+            "one more piece must not fit"
+        );
     }
 }

@@ -48,6 +48,8 @@ impl Lane {
 pub struct ChunkTask {
     pub audio: Arc<Vec<f32>>,
     pub span: Span,
+    /// VAD pieces inside `span`, decoded back to back; empty decodes the whole span.
+    pub pieces: Arc<Vec<Span>>,
     pub opts: Arc<DecodeOptions>,
     pub language: Option<String>,
 }
@@ -1907,6 +1909,7 @@ mod tests {
                 start: 0,
                 end: 16_000,
             },
+            pieces: Arc::new(Vec::new()),
             opts: Arc::new(DecodeOptions::default()),
             language: None,
         }
@@ -2237,6 +2240,7 @@ mod tests {
                     start: 0,
                     end: ms * 16,
                 },
+                pieces: Arc::new(Vec::new()),
                 opts: Arc::new(DecodeOptions::default()),
                 language: None,
             },

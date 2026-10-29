@@ -23,7 +23,7 @@ use crate::engine::{
 };
 use crate::format;
 use crate::jobs::JobManager;
-use crate::models::{ModelError, ModelInfo, Registry};
+use crate::models::{ModelError, ModelInfo, OPENAI_ALIAS, Registry};
 use crate::pipeline::Transcription;
 use crate::scheduler::Lane;
 use crate::vocabulary::{VocabularyError, VocabularyStore};
@@ -320,7 +320,17 @@ async fn status(State(state): State<AppState>) -> Json<serde_json::Value> {
     let mut v = serde_json::to_value(state.engine.status()).unwrap_or_default();
     let (queued, running) = state.jobs.counts();
     v["jobs"] = json!({"queued": queued, "running": running});
+    v["default_model"] = json!(default_model_id(&state));
     Json(v)
+}
+
+/// The catalog id `whisper-1` resolves to. An unknown or non-transcription target does not
+/// resolve, so the configured default name is reported instead.
+fn default_model_id(state: &AppState) -> &str {
+    state
+        .registry
+        .resolve(OPENAI_ALIAS)
+        .map_or(state.config.engine.default_model.as_str(), |entry| entry.id)
 }
 
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -1595,6 +1605,33 @@ mod tests {
         assert_eq!(v["recycle_failures"], 0);
         assert_eq!(v["last_error"]["message"], "boom");
         assert!(v["last_error"]["time"].is_string());
+        assert_eq!(v["default_model"], "base");
+    }
+
+    /// Status from a server whose registry is built from `cfg`, as the daemon builds it.
+    async fn status_with_registry(tag: &str, cfg: Config) -> serde_json::Value {
+        let vocab = VocabularyStore::new(&Default::default());
+        let mut state = test_state(tag, cfg.clone(), Arc::new(Fake), vocab);
+        state.registry = Arc::new(Registry::from_config(&cfg));
+        let req = Request::get("/hark/v1/status").body(Body::empty()).unwrap();
+        let (s, v, _) = call(router(state), req).await;
+        assert_eq!(s, StatusCode::OK);
+        v
+    }
+
+    #[tokio::test]
+    async fn status_default_model_follows_the_whisper_1_alias() {
+        let v = status_with_registry("dm-default", Config::default()).await;
+        assert_eq!(v["default_model"], "large-v3-turbo");
+        let cfg = Config::from_toml("[aliases]\n\"whisper-1\" = \"small\"\n").unwrap();
+        let v = status_with_registry("dm-alias", cfg).await;
+        assert_eq!(v["default_model"], "small");
+        let cfg = Config::from_toml("[aliases]\n\"whisper-1\" = \"silero-v5.1.2\"\n").unwrap();
+        let v = status_with_registry("dm-vad", cfg).await;
+        assert_eq!(v["default_model"], "large-v3-turbo");
+        let cfg = Config::from_toml("[engine]\ndefault_model = \"no-such-model\"\n").unwrap();
+        let v = status_with_registry("dm-unknown", cfg).await;
+        assert_eq!(v["default_model"], "no-such-model");
     }
 
     #[tokio::test]
