@@ -375,6 +375,14 @@ pub struct WhisperBackend {
     parked: Mutex<Vec<ParkedModel>>,
 }
 
+/// CPU states split the thread budget: oversubscribed ggml barriers spin and starve each other.
+fn decode_threads(cpu_threads: i32, states: usize, on_gpu: bool) -> i32 {
+    if on_gpu {
+        return cpu_threads;
+    }
+    (cpu_threads / states.max(1) as i32).max(1)
+}
+
 /// The patched ggml backend turns a device exception (out of device memory, device lost) into -100.
 pub fn is_device_fault_code(code: i32) -> bool {
     code == -100
@@ -805,6 +813,7 @@ impl Backend for WhisperBackend {
         let Some(st) = guard.as_mut() else {
             return Err(ChunkFailure::Failed("state was retired".into()));
         };
+        let threads = decode_threads(self.cpu_threads, loaded.states.len(), loaded.on_gpu);
         // Compacted decodes run at offset 0; seek_cs still reports the original span start.
         let decoded = if task.pieces.len() >= 2 {
             let compacted = pipeline::compact(&task.audio, &task.pieces);
@@ -815,7 +824,7 @@ impl Backend for WhisperBackend {
                 0,
                 &task.opts,
                 task.language.as_deref(),
-                self.cpu_threads,
+                threads,
                 abort,
             )
             .map(|mut out| {
@@ -834,7 +843,7 @@ impl Backend for WhisperBackend {
                 task.span.start,
                 &task.opts,
                 task.language.as_deref(),
-                self.cpu_threads,
+                threads,
                 abort,
             )
         };
@@ -1542,6 +1551,14 @@ fn decode_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_states_split_the_thread_budget() {
+        assert_eq!(decode_threads(8, 2, false), 4);
+        assert_eq!(decode_threads(8, 3, false), 2);
+        assert_eq!(decode_threads(1, 2, false), 1);
+        assert_eq!(decode_threads(8, 2, true), 8);
+    }
 
     fn gpu(index: i32, name: &str, discrete: bool) -> GpuInfo {
         GpuInfo {
