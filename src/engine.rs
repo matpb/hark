@@ -1316,7 +1316,12 @@ impl<B: Backend> Transcriber for WhisperEngine<B> {
                 tracing::info!("dropped prompt echo words={n}");
             }
         }
-        let end_secs = decoded_end as f64 / f64::from(crate::audio::SAMPLE_RATE);
+        // Last speech, not the decoded end: a clip cut mid-word ends its speech before the decoded tail.
+        let end_secs = speech_secs
+            .iter()
+            .map(|r| r.1)
+            .reduce(f64::max)
+            .unwrap_or(decoded_end as f64 / f64::from(crate::audio::SAMPLE_RATE));
         let (kept, n) = guard::drop_end_repeat(segments, end_secs);
         segments = kept;
         if n > 0 {
