@@ -294,7 +294,7 @@ curl http://127.0.0.1:8797/v1/audio/transcriptions \
   -F file=@long.m4a -F model=whisper-1 -F x_priority=batch
 ```
 
-Request fields: `file`, `model`, `language` (ISO 639-1, auto-detected when absent), `prompt`, `response_format`, `temperature`, `timestamp_granularities[]` (only with `verbose_json`), `stream` (accepted and ignored), plus hark's `x_vocabulary` (profile name, default `default`, `none` to disable), `x_priority` (`interactive` default, or `batch`) and `x_vad` (`true` or `false`). Unknown fields are ignored. Any format ffmpeg decodes is accepted.
+Request fields: `file`, `model`, `language` (ISO 639-1, auto-detected when absent), `prompt`, `keywords` (one term per `keywords[]` field, see Vocabulary per request), `response_format`, `temperature`, `timestamp_granularities[]` (only with `verbose_json`), `stream` (accepted and ignored), plus hark's `x_vocabulary` (profile name, default `default`, `none` to disable), `x_priority` (`interactive` default, or `batch`) and `x_vad` (`true` or `false`). Unknown fields are ignored. Any format ffmpeg decodes is accepted.
 
 ### OpenAI Python SDK
 
@@ -362,10 +362,10 @@ Errors use OpenAI's envelope: `{"error": {"message", "type", "param", "code"}}`.
 | Command | Does |
 |---|---|
 | `hark serve [--log-file f]` | Run the daemon (what the service runs). `--log-file` overrides `server.log_file`. |
-| `hark transcribe <file> [--model --language --format --vocabulary --priority] [--local]` | Transcribe through the running daemon and print the result (`--format` is `text` by default). `--local` runs in this process without the daemon. |
+| `hark transcribe <file> [--model --language --format --vocabulary --keyword --priority] [--local]` | Transcribe through the running daemon and print the result (`--format` is `text` by default). `--local` runs in this process without the daemon. |
 | `hark models list` | Catalog with installed and loaded state. |
 | `hark models pull <id>` or `pull --defaults` / `rm <id>` / `load <id>` / `unload <id>` | Manage models. |
-| `hark jobs submit <file> [--model --language --format --vocabulary]` | Submit a job. Files under `jobs.path_roots` are sent by path, others are uploaded. |
+| `hark jobs submit <file> [--model --language --format --vocabulary --keyword]` | Submit a job. Files under `jobs.path_roots` are sent by path, others are uploaded. |
 | `hark jobs list [--status s]` / `get <id>` / `result <id> [--format f]` / `cancel <id>` | Inspect and control jobs. |
 | `hark status` | Readable `/hark/v1/status`. |
 | `hark doctor [--all]` | Health checks, one line each; exits non-zero on any FAIL. `--all` also verifies the SHA-256 of every installed model. |
@@ -387,6 +387,61 @@ terms = ["subpoena", "estoppel"]
 ```
 
 Pick a profile per request with `x_vocabulary=legal`; `x_vocabulary=none` sends no vocabulary. Terms from `terms`, `files` and `wspr_config` are merged and de-duplicated. Reload as described in the per-OS table (SIGHUP on Linux and macOS, restart on Windows); a bad file keeps the previous profiles. If you use the Wspr dictation app, hark imports its custom vocabulary automatically into `default` (see above) and re-reads it when the file changes.
+
+## Vocabulary per request
+
+`keywords` is OpenAI's own request field for custom vocabulary: an array of terms, sent as one `keywords[]` multipart field per term. hark adds them to the profile the request selects with `x_vocabulary` (the `default` profile when the field is absent, nothing with `none`) for that one request.
+
+```
+# curl: one -F per term
+curl http://127.0.0.1:8797/v1/audio/transcriptions \
+  -F file=@memo.m4a -F model=whisper-1 \
+  -F 'keywords[]=Ghidra' -F 'keywords[]=Zstandard'
+
+# keywords only, without the profile
+curl http://127.0.0.1:8797/v1/audio/transcriptions \
+  -F file=@memo.m4a -F model=whisper-1 -F x_vocabulary=none \
+  -F 'keywords[]=Kubernetes' -F 'keywords[]=PostgreSQL'
+
+# the jobs API takes a JSON array
+curl -H 'content-type: application/json' \
+  -d '{"path": "/home/you/audio/lecture.m4a", "model": "whisper-1", "keywords": ["Ghidra", "Zstandard"]}' \
+  http://127.0.0.1:8797/hark/v1/jobs
+
+# the CLI repeats --keyword
+hark transcribe memo.m4a --keyword Ghidra --keyword Zstandard
+```
+
+```python
+result = client.audio.transcriptions.create(
+    model="whisper-1",
+    file=f,
+    keywords=["Ghidra", "Zstandard"],
+)
+```
+
+Older SDKs without the `keywords` parameter can send `extra_body={"keywords": [...]}`; it goes out as the same `keywords[]` fields.
+
+```js
+const result = await client.audio.transcriptions.create({
+  model: "whisper-1",
+  file: fs.createReadStream("memo.m4a"),
+  keywords: ["Ghidra", "Zstandard"],
+});
+```
+
+How hark uses them:
+
+- Keywords go into whisper's initial prompt after the profile terms, in the same sentence: "We talked about Kubernetes, PostgreSQL, Ghidra and Zstandard." The request `prompt` still follows, and a term that appears twice (ignoring case) is written once.
+- Send `x_vocabulary=none` to use the keywords alone.
+- A keyword with capitals after its first letter, such as `PostgreSQL`, also fixes its spelling in the output, as profile terms do.
+- Keywords give the same prompt, and so the same text, as the same terms sent as a comma list in `prompt`.
+- A request without keywords builds the same prompt as before, now held to whisper's real 223-token window (1.1.1 allowed 224, and whisper then cut the first token). Keyword and prompt text is never logged.
+
+Limits and errors, all 400 with `param: "keywords"`:
+
+- At most 100 keywords (`too_many_keywords`) of at most 50 characters each. Items are trimmed, then an empty item, a `<` or `>`, a line break or another control character is `invalid_value`. Repeats ignoring case are dropped.
+- Whisper keeps 223 prompt tokens (half its 448-token text context, minus the previous-text marker). When the prompt is too long, profile terms are dropped from the end first; keywords never are. If the keywords and the request `prompt` alone do not fit, the request fails with `keywords_too_long` instead of silently losing terms.
 
 ## Security notes
 

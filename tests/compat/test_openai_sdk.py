@@ -244,6 +244,38 @@ for fmt in ("json", "text", "srt", "vtt"):
         err = e.body if isinstance(e.body, dict) else {}
         check(f"granularities with {fmt}: 400", e.status_code == 400 and err.get("code") == "invalid_value", str(e.body))
 
+# ---- keywords (the typed parameter, sent as keywords[]) ----
+
+VOCAB = Path(__file__).resolve().parent.parent / "fixtures" / "vocabulary.wav"
+TERMS = ["Oluwaseun", "Ghidra", "Yggdrasil", "Zstandard"]
+NO_PROFILE = {"x_vocabulary": "none"}
+
+with open(VOCAB, "rb") as f:
+    t = client.audio.transcriptions.create(
+        model="whisper-1", file=f, language="en", response_format="text", keywords=TERMS, extra_body=NO_PROFILE
+    )
+check("keywords: the four terms come back exactly", all(term in str(t) for term in TERMS), str(t))
+
+try:
+    with open(VOCAB, "rb") as f:
+        client.audio.transcriptions.create(model="whisper-1", file=f, keywords=["a<b"], extra_body=NO_PROFILE)
+    check("keywords: forbidden character is 400", False, "no error raised")
+except BadRequestError as e:
+    err = e.body if isinstance(e.body, dict) else {}
+    check("keywords: forbidden character is 400",
+          e.status_code == 400 and err.get("param") == "keywords" and err.get("code") == "invalid_value", str(e.body))
+
+try:
+    with open(VOCAB, "rb") as f:
+        client.audio.transcriptions.create(
+            model="whisper-1", file=f, keywords=[f"term{i}" for i in range(101)], extra_body=NO_PROFILE
+        )
+    check("keywords: 101 is 400 too_many_keywords", False, "no error raised")
+except BadRequestError as e:
+    err = e.body if isinstance(e.body, dict) else {}
+    check("keywords: 101 is 400 too_many_keywords",
+          e.status_code == 400 and err.get("code") == "too_many_keywords", str(e.body))
+
 status = httpx.get(BASE.removesuffix("/v1") + "/hark/v1/status", timeout=10)
 check("status: 200 json", status.status_code == 200, status.text)
 st = status.json() if status.status_code == 200 else {}

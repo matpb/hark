@@ -16,8 +16,8 @@ use crate::config::{Config, Device, EngineConfig};
 use crate::guard;
 use crate::models::Registry;
 use crate::pipeline::{
-    self, ChunkReport, MAX_CHUNK, MIN_ADVANCE, MIN_CHUNK, PromptStyle, Segment, Span, TokenInfo,
-    Transcription,
+    self, ChunkReport, MAX_CHUNK, MIN_ADVANCE, MIN_CHUNK, PromptStyle, PromptTooLong, Segment,
+    Span, TokenInfo, Transcription,
 };
 use crate::scheduler::{
     Backend, ChunkFailure, ChunkOut, ChunkRequest, ChunkTask, DeviceStatus, Lane, LoadReport,
@@ -32,6 +32,8 @@ pub struct DecodeOptions {
     pub prompt: Option<String>,
     /// Terms of the resolved vocabulary profile, in priority order.
     pub vocabulary: Vec<String>,
+    /// Request `keywords`, validated.
+    pub keywords: Vec<String>,
     pub temperature: f32,
     /// Request `x_vad`; `None` uses the configured default.
     pub vad: Option<bool>,
@@ -55,6 +57,8 @@ pub enum EngineError {
     Busy { retry_after_secs: u64 },
     #[error("model {0} is being deleted")]
     ModelBusy(String),
+    #[error("keywords and prompt need {needed} prompt tokens; the model keeps at most {limit}")]
+    KeywordsTooLong { needed: usize, limit: usize },
 }
 
 /// One transcription request as the scheduler sees it.
@@ -876,6 +880,10 @@ impl Backend for WhisperBackend {
                 Err(ChunkFailure::Transient(e.to_string()))
             }
             Err(DecodeFailure::Whisper(e)) => Err(ChunkFailure::Failed(e.to_string())),
+            Err(DecodeFailure::Prompt(e)) => Err(ChunkFailure::KeywordsTooLong {
+                needed: e.needed,
+                limit: e.limit,
+            }),
         }
     }
 }
@@ -1309,7 +1317,10 @@ impl<B: Backend> Transcriber for WhisperEngine<B> {
                 tracing::info!("dropped unvoiced words={n}");
             }
         }
-        if let Some(prompt) = initial_prompt(opts, self.prompt_style, usize::MAX, &|_| 0) {
+        if let Some(prompt) = initial_prompt(opts, self.prompt_style, usize::MAX, &|_| 0)
+            .ok()
+            .flatten()
+        {
             let (kept, n) = guard::drop_prompt_echo(segments, &prompt, &vocabulary_terms(opts));
             segments = kept;
             if n > 0 {
@@ -1357,6 +1368,7 @@ impl<B: Backend> Transcriber for WhisperEngine<B> {
 enum DecodeFailure {
     Aborted,
     Whisper(WhisperError),
+    Prompt(PromptTooLong),
 }
 
 impl From<WhisperError> for DecodeFailure {
@@ -1546,26 +1558,33 @@ fn make_params<'a>(
     params
 }
 
-/// The initial prompt of a request: profile terms and the request prompt in `style`, without NUL prompts.
+/// The initial prompt of a request: profile terms, keywords and the request prompt in `style`, without NUL prompts.
 fn initial_prompt(
     opts: &DecodeOptions,
     style: PromptStyle,
     limit: usize,
     count: &dyn Fn(&str) -> usize,
-) -> Option<String> {
+) -> Result<Option<String>, PromptTooLong> {
     pipeline::build_initial_prompt(
         &opts.vocabulary,
+        &opts.keywords,
         opts.prompt.as_deref(),
         style,
         limit,
         count,
     )
-    .filter(|p| !p.contains('\0'))
+    .map(|p| p.filter(|p| !p.contains('\0')))
 }
 
-/// Profile terms plus the terms of a list-style request prompt, exact duplicates removed.
+/// Prompt tokens whisper.cpp keeps after the prev marker: max_prompt_ctx - 1 (whisper.cpp:7152).
+fn prompt_token_limit(n_text_ctx: i32) -> usize {
+    ((n_text_ctx.max(2) / 2) as usize).saturating_sub(1)
+}
+
+/// Profile terms, keywords, then the terms of a list-style request prompt, exact duplicates removed.
 fn vocabulary_terms(opts: &DecodeOptions) -> Vec<String> {
     let mut terms = opts.vocabulary.clone();
+    terms.extend(opts.keywords.iter().cloned());
     if let Some(p) = opts.prompt.as_deref() {
         terms.extend(pipeline::prompt_terms(p));
     }
@@ -1586,14 +1605,14 @@ fn decode_chunk(
     style: PromptStyle,
     abort: &AtomicBool,
 ) -> Result<ChunkOut, DecodeFailure> {
-    let limit = (loaded.ctx.n_text_ctx().max(2) / 2) as usize;
+    let limit = prompt_token_limit(loaded.ctx.n_text_ctx());
     let count = |t: &str| {
         loaded
             .ctx
             .tokenize(t, t.len() + 8)
             .map_or(t.len(), |v| v.len())
     };
-    let prompt = initial_prompt(opts, style, limit, &count);
+    let prompt = initial_prompt(opts, style, limit, &count).map_err(DecodeFailure::Prompt)?;
     let terms = vocabulary_terms(opts);
     let abort_ctx = AbortCtx {
         flag: abort,
@@ -1770,6 +1789,133 @@ mod tests {
             no_speech_prob: 0.0,
             words: Vec::new(),
         }
+    }
+
+    #[test]
+    fn keywords_prompt_token_limit_keeps_one_less_than_half_the_text_context() {
+        assert_eq!(prompt_token_limit(448), 223);
+        assert_eq!(prompt_token_limit(2), 0);
+        assert_eq!(prompt_token_limit(1), 0);
+        assert_eq!(prompt_token_limit(0), 0);
+        assert_eq!(prompt_token_limit(-5), 0);
+        assert_eq!(prompt_token_limit(i32::MAX), (i32::MAX / 2) as usize - 1);
+    }
+
+    fn keyword_opts(profile: &[&str], keywords: &[&str], prompt: Option<&str>) -> DecodeOptions {
+        let owned = |v: &[&str]| v.iter().map(|t| t.to_string()).collect();
+        DecodeOptions {
+            vocabulary: owned(profile),
+            keywords: owned(keywords),
+            prompt: prompt.map(str::to_string),
+            ..DecodeOptions::default()
+        }
+    }
+
+    #[test]
+    fn keywords_sit_between_the_profile_and_the_prompt_terms_without_duplicates() {
+        let opts = keyword_opts(&["A", "B"], &["K1", "B"], Some("P1, K1, P2"));
+        assert_eq!(vocabulary_terms(&opts), ["A", "B", "K1", "P1", "P2"]);
+        let none = keyword_opts(&["A", "B"], &[], Some("P1, A, P2"));
+        assert_eq!(vocabulary_terms(&none), ["A", "B", "P1", "P2"]);
+    }
+
+    #[test]
+    fn keywords_fix_their_mixed_case_spelling_in_the_output() {
+        let opts = keyword_opts(&[], &["PostgreSQL", "Kubernetes"], None);
+        let terms = vocabulary_terms(&opts);
+        assert_eq!(
+            pipeline::canonical_case("we run postgresql and kubernetes", &terms),
+            "we run PostgreSQL and kubernetes"
+        );
+    }
+
+    #[test]
+    fn keywords_only_prompt_echo_is_dropped() {
+        let opts = keyword_opts(&[], &["Ghidra", "Yggdrasil", "Zstandard"], None);
+        let prompt = initial_prompt(&opts, PromptStyle::Sentence, usize::MAX, &|_| 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prompt, "We talked about Ghidra, Yggdrasil and Zstandard.");
+        let segs = vec![
+            seg(
+                0.0,
+                2.0,
+                " We talked about Ghidra, Yggdrasil and Zstandard.",
+            ),
+            seg(2.0, 4.0, " Something else entirely."),
+        ];
+        let (kept, n) = guard::drop_prompt_echo(segs, &prompt, &vocabulary_terms(&opts));
+        assert_eq!(n, 7);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].text, " Something else entirely.");
+    }
+
+    #[test]
+    fn keywords_over_the_window_fail_the_prompt_and_without_keywords_it_passes() {
+        let count = |t: &str| t.split_whitespace().count();
+        let opts = keyword_opts(&[], &["one", "two", "three"], None);
+        assert_eq!(
+            initial_prompt(&opts, PromptStyle::Sentence, 4, &count),
+            Err(PromptTooLong {
+                needed: 7,
+                limit: 4
+            })
+        );
+        let plain = keyword_opts(&[], &[], Some("one two three four five six"));
+        assert_eq!(
+            initial_prompt(&plain, PromptStyle::Sentence, 4, &count),
+            Ok(Some("one two three four five six".to_string()))
+        );
+        let nul = keyword_opts(&[], &["one"], Some("a\0b"));
+        assert_eq!(
+            initial_prompt(&nul, PromptStyle::Sentence, usize::MAX, &count),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs large-v3-turbo weights"]
+    fn keywords_prompt_build_cost() {
+        if !std::env::var("HARK_MODEL_TESTS").is_ok_and(|v| v == "1") {
+            eprintln!("skipped: set HARK_MODEL_TESTS=1 to run model-backed tests");
+            return;
+        }
+        let mut cfg = Config::default();
+        if let Ok(dir) = std::env::var("HARK_TEST_MODELS_DIR") {
+            cfg.models.extra_dirs = vec![dir];
+        }
+        let (_, path) = Registry::from_config(&cfg)
+            .resolve_installed("large-v3-turbo")
+            .expect(
+                "large-v3-turbo installed in HARK_TEST_MODELS_DIR (default ~/.config/Wspr/models)",
+            );
+        let mut params = WhisperContextParameters::new();
+        params.use_gpu(false);
+        let ctx = WhisperContext::new_with_params(path.to_str().unwrap(), params).unwrap();
+        let count = |t: &str| ctx.tokenize(t, t.len() + 8).map_or(t.len(), |v| v.len());
+        let words = |prefix: &str, n: usize| -> Vec<String> {
+            (0..n).map(|i| format!("{prefix}{i}")).collect()
+        };
+        let opts = DecodeOptions {
+            vocabulary: words("Profileterm", 17),
+            keywords: words("Keyword", 30),
+            ..DecodeOptions::default()
+        };
+        let limit = prompt_token_limit(ctx.n_text_ctx());
+        let builds = 200;
+        let started = Instant::now();
+        let mut prompt = None;
+        for _ in 0..builds {
+            prompt = Some(initial_prompt(&opts, PromptStyle::Sentence, limit, &count).unwrap());
+        }
+        let mean_ms = started.elapsed().as_secs_f64() * 1000.0 / f64::from(builds);
+        let prompt = prompt.flatten().expect("a prompt was built");
+        eprintln!(
+            "KEYWORDS prompt build: mean {mean_ms:.3} ms over {builds} builds, {} tokens of {limit}",
+            count(&prompt)
+        );
+        assert!(prompt.contains("Keyword29"), "keywords stay whole");
+        assert!(mean_ms < 5.0, "mean {mean_ms:.3} ms");
     }
 
     #[test]

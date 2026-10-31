@@ -114,23 +114,46 @@ pub fn sentence(terms: &[String]) -> String {
     out
 }
 
-/// Vocabulary terms, then the request prompt, in `style`. Over `limit` tokens (as `count` measures them),
-/// profile terms drop from the end; the request prompt, or its term list, stays whole.
+/// Request keywords and prompt that do not fit whisper's prompt window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptTooLong {
+    pub needed: usize,
+    pub limit: usize,
+}
+
+/// Profile terms, keywords, then the request prompt, in `style`. Over `limit` tokens (per `count`) profile
+/// terms drop from the end; with keywords, a prompt over `limit` even without them is an error.
 pub fn build_initial_prompt(
     terms: &[String],
+    keywords: &[String],
     request: Option<&str>,
     style: PromptStyle,
     limit: usize,
     count: &dyn Fn(&str) -> usize,
-) -> Option<String> {
+) -> Result<Option<String>, PromptTooLong> {
     let request = request.map(str::trim).filter(|p| !p.is_empty());
-    let request_terms = match style {
+    let prompt_list = match style {
         PromptStyle::Sentence => request
             .map(prompt_terms)
             .filter(|t| t.len() >= 2)
             .unwrap_or_default(),
         PromptStyle::List => Vec::new(),
     };
+    let prose = if prompt_list.is_empty() {
+        request
+    } else {
+        None
+    };
+    let keyword_keys: Vec<String> = keywords.iter().map(|k| k.to_lowercase()).collect();
+    let request_terms: Vec<String> = keywords
+        .iter()
+        .cloned()
+        .chain(
+            prompt_list
+                .into_iter()
+                .filter(|t| !keyword_keys.contains(&t.to_lowercase())),
+        )
+        .collect();
     let profile: Vec<String> = if request_terms.is_empty() {
         terms.to_vec()
     } else {
@@ -142,33 +165,23 @@ pub fn build_initial_prompt(
             .collect()
     };
     let compose = |n: usize| -> String {
-        match style {
-            PromptStyle::List => {
-                let mut parts = Vec::new();
-                if n > 0 {
-                    parts.push(profile[..n].join(", "));
-                }
-                if let Some(p) = request {
-                    parts.push(p.to_string());
-                }
-                parts.join(" ")
-            }
-            PromptStyle::Sentence if !request_terms.is_empty() => {
-                let all: Vec<String> = profile[..n].iter().chain(&request_terms).cloned().collect();
-                sentence(&all)
-            }
-            PromptStyle::Sentence => {
-                let mut parts = Vec::new();
-                if n > 0 {
-                    parts.push(sentence(&profile[..n]));
-                }
-                if let Some(p) = request {
-                    parts.push(p.to_string());
-                }
-                parts.join(" ")
-            }
-        }
+        let all: Vec<String> = profile[..n].iter().chain(&request_terms).cloned().collect();
+        let head = match style {
+            PromptStyle::List => all.join(", "),
+            PromptStyle::Sentence => sentence(&all),
+        };
+        [head.as_str(), prose.unwrap_or_default()]
+            .into_iter()
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
     };
+    if !keywords.is_empty() {
+        let needed = count(&compose(0));
+        if needed > limit {
+            return Err(PromptTooLong { needed, limit });
+        }
+    }
     let (mut lo, mut hi) = (0usize, profile.len());
     if hi > 0 && count(&compose(hi)) <= limit {
         lo = hi;
@@ -182,7 +195,7 @@ pub fn build_initial_prompt(
         }
     }
     let prompt = compose(lo);
-    (!prompt.is_empty()).then_some(prompt)
+    Ok((!prompt.is_empty()).then_some(prompt))
 }
 
 /// Byte length of the prefix of `text` that equals `term` ignoring case, if any.
@@ -1088,26 +1101,45 @@ mod tests {
     fn initial_prompt_orders_terms_before_the_request_prompt() {
         let big = usize::MAX;
         assert_eq!(
-            build_initial_prompt(&[], None, PromptStyle::List, big, &words_count),
+            build_initial_prompt(&[], &[], None, PromptStyle::List, big, &words_count).unwrap(),
             None
         );
         assert_eq!(
-            build_initial_prompt(&[], Some("  "), PromptStyle::List, big, &words_count),
+            build_initial_prompt(&[], &[], Some("  "), PromptStyle::List, big, &words_count)
+                .unwrap(),
             None
         );
         assert_eq!(
-            build_initial_prompt(&[], Some("hello"), PromptStyle::List, big, &words_count)
-                .as_deref(),
+            build_initial_prompt(
+                &[],
+                &[],
+                Some("hello"),
+                PromptStyle::List,
+                big,
+                &words_count
+            )
+            .unwrap()
+            .as_deref(),
             Some("hello")
         );
         let terms = vec!["Kubernetes".to_string(), "Grafana".to_string()];
         assert_eq!(
-            build_initial_prompt(&terms, Some("hello"), PromptStyle::List, big, &words_count)
-                .as_deref(),
+            build_initial_prompt(
+                &terms,
+                &[],
+                Some("hello"),
+                PromptStyle::List,
+                big,
+                &words_count
+            )
+            .unwrap()
+            .as_deref(),
             Some("Kubernetes, Grafana hello")
         );
         assert_eq!(
-            build_initial_prompt(&terms, None, PromptStyle::List, big, &words_count).as_deref(),
+            build_initial_prompt(&terms, &[], None, PromptStyle::List, big, &words_count)
+                .unwrap()
+                .as_deref(),
             Some("Kubernetes, Grafana")
         );
     }
@@ -1115,8 +1147,9 @@ mod tests {
     #[test]
     fn initial_prompt_drops_terms_from_the_end_and_keeps_the_request_whole() {
         let terms: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
-        let p =
-            |limit, req| build_initial_prompt(&terms, req, PromptStyle::List, limit, &words_count);
+        let p = |limit, req| {
+            build_initial_prompt(&terms, &[], req, PromptStyle::List, limit, &words_count).unwrap()
+        };
         assert_eq!(p(4, None).as_deref(), Some("a, b, c, d"));
         assert_eq!(p(3, None).as_deref(), Some("a, b, c"));
         assert_eq!(p(1, None).as_deref(), Some("a"));
@@ -2224,11 +2257,13 @@ mod tests {
         let s = |terms: &[&str], req| {
             build_initial_prompt(
                 &strs(terms),
+                &[],
                 req,
                 PromptStyle::Sentence,
                 usize::MAX,
                 &words_count,
             )
+            .unwrap()
         };
         assert_eq!(
             s(&["OKAPI", "Laravel"], None).as_deref(),
@@ -2260,7 +2295,8 @@ mod tests {
     fn sentence_prompt_drops_profile_terms_from_the_end_and_keeps_request_terms() {
         let terms = strs(&["a", "b", "c", "d"]);
         let p = |limit, req| {
-            build_initial_prompt(&terms, req, PromptStyle::Sentence, limit, &words_count)
+            build_initial_prompt(&terms, &[], req, PromptStyle::Sentence, limit, &words_count)
+                .unwrap()
         };
         assert_eq!(
             p(10, Some("x, y")).as_deref(),
@@ -2301,14 +2337,400 @@ mod tests {
         assert_eq!(
             build_initial_prompt(
                 &terms,
+                &[],
                 Some("okapi, Laravel"),
                 PromptStyle::List,
                 usize::MAX,
                 &words_count
             )
+            .unwrap()
             .as_deref(),
             Some("OKAPI okapi, Laravel")
         );
+    }
+
+    // The 1.1.1 builder, frozen verbatim, as the oracle for requests without keywords.
+    fn build_initial_prompt_1_1_1(
+        terms: &[String],
+        request: Option<&str>,
+        style: PromptStyle,
+        limit: usize,
+        count: &dyn Fn(&str) -> usize,
+    ) -> Option<String> {
+        let request = request.map(str::trim).filter(|p| !p.is_empty());
+        let request_terms = match style {
+            PromptStyle::Sentence => request
+                .map(prompt_terms)
+                .filter(|t| t.len() >= 2)
+                .unwrap_or_default(),
+            PromptStyle::List => Vec::new(),
+        };
+        let profile: Vec<String> = if request_terms.is_empty() {
+            terms.to_vec()
+        } else {
+            let lower: Vec<String> = request_terms.iter().map(|t| t.to_lowercase()).collect();
+            terms
+                .iter()
+                .filter(|t| !lower.contains(&t.to_lowercase()))
+                .cloned()
+                .collect()
+        };
+        let compose = |n: usize| -> String {
+            match style {
+                PromptStyle::List => {
+                    let mut parts = Vec::new();
+                    if n > 0 {
+                        parts.push(profile[..n].join(", "));
+                    }
+                    if let Some(p) = request {
+                        parts.push(p.to_string());
+                    }
+                    parts.join(" ")
+                }
+                PromptStyle::Sentence if !request_terms.is_empty() => {
+                    let all: Vec<String> =
+                        profile[..n].iter().chain(&request_terms).cloned().collect();
+                    sentence(&all)
+                }
+                PromptStyle::Sentence => {
+                    let mut parts = Vec::new();
+                    if n > 0 {
+                        parts.push(sentence(&profile[..n]));
+                    }
+                    if let Some(p) = request {
+                        parts.push(p.to_string());
+                    }
+                    parts.join(" ")
+                }
+            }
+        };
+        let (mut lo, mut hi) = (0usize, profile.len());
+        if hi > 0 && count(&compose(hi)) <= limit {
+            lo = hi;
+        }
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if count(&compose(mid)) <= limit {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let prompt = compose(lo);
+        (!prompt.is_empty()).then_some(prompt)
+    }
+
+    fn keywords_prompt(
+        terms: &[&str],
+        keywords: &[&str],
+        req: Option<&str>,
+        style: PromptStyle,
+    ) -> Result<Option<String>, PromptTooLong> {
+        build_initial_prompt(
+            &strs(terms),
+            &strs(keywords),
+            req,
+            style,
+            usize::MAX,
+            &words_count,
+        )
+    }
+
+    #[test]
+    fn keywords_follow_the_profile_terms_and_lead_the_prompt_list() {
+        assert_eq!(
+            keywords_prompt(
+                &["P1", "P2"],
+                &["K1"],
+                Some("L1, L2"),
+                PromptStyle::Sentence
+            ),
+            Ok(Some("We talked about P1, P2, K1, L1 and L2.".to_string()))
+        );
+    }
+
+    #[test]
+    fn keywords_only_prompt_keeps_prose_after_the_sentence() {
+        assert_eq!(
+            keywords_prompt(
+                &[],
+                &["K1", "K2"],
+                Some("Notes follow."),
+                PromptStyle::Sentence
+            ),
+            Ok(Some("We talked about K1 and K2. Notes follow.".to_string()))
+        );
+        assert_eq!(
+            keywords_prompt(&[], &["K1"], None, PromptStyle::Sentence),
+            Ok(Some("We talked about K1.".to_string()))
+        );
+    }
+
+    #[test]
+    fn keywords_in_list_style_join_with_commas_before_the_prose() {
+        assert_eq!(
+            keywords_prompt(
+                &["P1"],
+                &["K1", "K2"],
+                Some("prose here"),
+                PromptStyle::List
+            ),
+            Ok(Some("P1, K1, K2 prose here".to_string()))
+        );
+        assert_eq!(
+            keywords_prompt(&[], &["K1", "K2"], None, PromptStyle::List),
+            Ok(Some("K1, K2".to_string()))
+        );
+        assert_eq!(
+            keywords_prompt(&[], &["K1"], Some("A, B"), PromptStyle::List),
+            Ok(Some("K1 A, B".to_string())),
+            "a list style prompt is prose, never split"
+        );
+    }
+
+    #[test]
+    fn keywords_replace_an_equal_profile_term_ignoring_case() {
+        assert_eq!(
+            keywords_prompt(&["Ghidra", "P2"], &["ghidra"], None, PromptStyle::Sentence),
+            Ok(Some("We talked about P2 and ghidra.".to_string()))
+        );
+        assert_eq!(
+            keywords_prompt(&[], &["Zed"], Some("zed, Y"), PromptStyle::Sentence),
+            Ok(Some("We talked about Zed and Y.".to_string())),
+            "a prompt list item equal to a keyword is dropped"
+        );
+    }
+
+    #[test]
+    fn keywords_and_the_same_terms_as_a_prompt_list_build_the_same_prompt() {
+        for terms in [&[][..], &["P1", "P2"][..]] {
+            let a = keywords_prompt(terms, &["A", "B", "C"], None, PromptStyle::Sentence);
+            let b = keywords_prompt(terms, &[], Some("A, B, C"), PromptStyle::Sentence);
+            assert!(matches!(a, Ok(Some(_))));
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    fn keywords_stay_whole_while_profile_terms_drop_from_the_end() {
+        let terms = strs(&["a", "b", "c", "d"]);
+        let keywords = strs(&["x", "y"]);
+        let p = |limit| {
+            build_initial_prompt(
+                &terms,
+                &keywords,
+                None,
+                PromptStyle::Sentence,
+                limit,
+                &words_count,
+            )
+        };
+        let some = |s: &str| Ok(Some(s.to_string()));
+        assert_eq!(p(10), some("We talked about a, b, c, d, x and y."));
+        assert_eq!(p(9), some("We talked about a, b, c, x and y."));
+        assert_eq!(p(6), some("We talked about x and y."));
+        assert_eq!(
+            p(5),
+            Err(PromptTooLong {
+                needed: 6,
+                limit: 5
+            })
+        );
+        assert_eq!(
+            p(0),
+            Err(PromptTooLong {
+                needed: 6,
+                limit: 0
+            })
+        );
+    }
+
+    #[test]
+    fn keywords_with_prose_count_the_prose_in_the_budget() {
+        let keywords = strs(&["x", "y"]);
+        let p = |limit| {
+            build_initial_prompt(
+                &strs(&["a"]),
+                &keywords,
+                Some("one two"),
+                PromptStyle::List,
+                limit,
+                &words_count,
+            )
+        };
+        assert_eq!(p(5), Ok(Some("a, x, y one two".to_string())));
+        assert_eq!(p(4), Ok(Some("x, y one two".to_string())));
+        assert_eq!(
+            p(3),
+            Err(PromptTooLong {
+                needed: 4,
+                limit: 3
+            })
+        );
+    }
+
+    #[test]
+    fn keywords_cost_one_count_call_more_than_the_same_prompt_without() {
+        let calls = std::cell::Cell::new(0usize);
+        let count = |t: &str| {
+            calls.set(calls.get() + 1);
+            words_count(t)
+        };
+        let terms = strs(&["a", "b", "c", "d"]);
+        let run = |keywords: &[String]| {
+            calls.set(0);
+            build_initial_prompt(&terms, keywords, None, PromptStyle::Sentence, 100, &count)
+                .unwrap();
+            calls.get()
+        };
+        let plain = run(&[]);
+        assert_eq!(plain, 1);
+        assert_eq!(run(&strs(&["x"])), 2);
+    }
+
+    #[test]
+    fn an_over_long_prompt_without_keywords_still_passes_whole() {
+        let calls = std::cell::Cell::new(0usize);
+        let count = |t: &str| {
+            calls.set(calls.get() + 1);
+            words_count(t)
+        };
+        assert_eq!(
+            build_initial_prompt(
+                &[],
+                &[],
+                Some("one two three four five"),
+                PromptStyle::List,
+                1,
+                &count
+            ),
+            Ok(Some("one two three four five".to_string()))
+        );
+        assert_eq!(calls.get(), 0, "no profile terms, no count call");
+        assert_eq!(
+            build_initial_prompt(
+                &strs(&["a"]),
+                &[],
+                Some("x, y"),
+                PromptStyle::Sentence,
+                0,
+                &words_count
+            ),
+            Ok(Some("We talked about x and y.".to_string()))
+        );
+    }
+
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self, n: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((self.0 >> 33) as usize) % n
+        }
+    }
+
+    const POOL: [&str; 16] = [
+        "Kubernetes",
+        "kubernetes",
+        "Grafana",
+        "OKAPI",
+        "okapi",
+        "DataGrid",
+        "New York",
+        "S\u{e3}o Paulo",
+        "Z\u{fc}rich",
+        "ZÜRICH",
+        "Ghidra",
+        "PostgreSQL",
+        "tmux",
+        "Yggdrasil",
+        "the build server",
+        "\u{4e1c}\u{4eac}",
+    ];
+
+    fn generated_request(rng: &mut Lcg) -> Option<String> {
+        let item = |rng: &mut Lcg| -> String {
+            match rng.next(10) {
+                0 => "one two three four five".to_string(),
+                1 => "x".repeat(41),
+                _ => POOL[rng.next(POOL.len())].to_string(),
+            }
+        };
+        match rng.next(9) {
+            0 => None,
+            1 => Some(String::new()),
+            2 => Some("  ".to_string()),
+            3 => Some(POOL[rng.next(POOL.len())].to_string()),
+            4..=6 => {
+                let n = 2 + rng.next(5);
+                let mut out = String::new();
+                for i in 0..n {
+                    if i > 0 {
+                        out.push_str(if rng.next(2) == 0 { ", " } else { "\n" });
+                    }
+                    out.push_str(&item(rng));
+                }
+                Some(out)
+            }
+            7 => Some("Hello there. This is earlier text.".to_string()),
+            _ => Some(
+                "We went over the plan again and again until it made sense to all of us here"
+                    .repeat(1 + rng.next(4)),
+            ),
+        }
+    }
+
+    #[test]
+    fn prompt_builder_without_keywords_matches_1_1_1() {
+        let mut rng = Lcg(0x5eed);
+        let limits = [0usize, 3, 10, 40, 223, usize::MAX];
+        let mut cases = 0;
+        for _ in 0..4000 {
+            let terms: Vec<String> = (0..rng.next(31))
+                .map(|_| POOL[rng.next(POOL.len())].to_string())
+                .collect();
+            let request = generated_request(&mut rng);
+            let style = if rng.next(2) == 0 {
+                PromptStyle::Sentence
+            } else {
+                PromptStyle::List
+            };
+            let limit = limits[rng.next(limits.len())];
+            let by_chars = rng.next(2) == 0;
+            let measure = |t: &str| {
+                if by_chars {
+                    t.chars().count() / 3 + 1
+                } else {
+                    words_count(t)
+                }
+            };
+            let old_calls = std::cell::RefCell::new(Vec::new());
+            let new_calls = std::cell::RefCell::new(Vec::new());
+            let old = build_initial_prompt_1_1_1(&terms, request.as_deref(), style, limit, &|t| {
+                old_calls.borrow_mut().push(t.to_string());
+                measure(t)
+            });
+            let new = build_initial_prompt(&terms, &[], request.as_deref(), style, limit, &|t| {
+                new_calls.borrow_mut().push(t.to_string());
+                measure(t)
+            });
+            assert_eq!(
+                new,
+                Ok(old),
+                "{terms:?} {request:?} {style:?} limit {limit}"
+            );
+            assert_eq!(
+                new_calls.borrow().len(),
+                old_calls.borrow().len(),
+                "count calls: {terms:?} {request:?} {style:?} limit {limit}"
+            );
+            assert_eq!(*new_calls.borrow(), *old_calls.borrow());
+            cases += 1;
+        }
+        assert!(cases >= 3000);
     }
 
     #[test]

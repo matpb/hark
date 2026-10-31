@@ -183,6 +183,20 @@ fn form_from_json(body: &[u8]) -> Result<(Form, Option<String>), ApiError> {
                 .push(json_text(other).ok_or_else(|| bad("granularities must be strings"))?),
         }
     }
+    for key in ["keywords", "keywords[]"] {
+        match obj.get(key) {
+            None | Some(Value::Null) => {}
+            Some(Value::Array(items)) => {
+                for it in items {
+                    form.keywords
+                        .push(json_text(it).ok_or_else(|| bad("keywords must be strings"))?);
+                }
+            }
+            Some(other) => form
+                .keywords
+                .push(json_text(other).ok_or_else(|| bad("keywords must be strings"))?),
+        }
+    }
     let path = match obj.get("path") {
         None | Some(Value::Null) => None,
         Some(Value::String(p)) => Some(p.clone()),
@@ -214,6 +228,7 @@ fn job_options(
         language: req.opts.language.clone(),
         prompt: req.opts.prompt.clone(),
         vocabulary,
+        keywords: req.opts.keywords.clone(),
         temperature: req.opts.temperature,
         vad: req.opts.vad,
         granularities: req.granularities.clone(),
@@ -512,5 +527,33 @@ mod tests {
         assert!(form_from_json(b"{").is_err());
         assert!(form_from_json(br#"{"path": 3}"#).is_err());
         assert!(form_from_json(br#"{"model": {"a": 1}}"#).is_err());
+    }
+
+    #[test]
+    fn keywords_in_json_bodies_map_onto_the_form() {
+        let form = |body: &str| form_from_json(body.as_bytes()).map(|(f, _)| f.keywords);
+        assert_eq!(
+            form(r#"{"keywords":["Ghidra","Zstandard"]}"#).unwrap(),
+            ["Ghidra", "Zstandard"]
+        );
+        assert_eq!(
+            form(r#"{"keywords[]":["A"],"keywords":["B"]}"#).unwrap(),
+            ["B", "A"]
+        );
+        assert_eq!(form(r#"{"keywords":"Ghidra"}"#).unwrap(), ["Ghidra"]);
+        assert!(form(r#"{"keywords":null}"#).unwrap().is_empty());
+        assert!(form(r#"{"keywords":[]}"#).unwrap().is_empty());
+        assert!(form(r#"{}"#).unwrap().is_empty());
+        assert_eq!(form(r#"{"keywords":[5,true]}"#).unwrap(), ["5", "true"]);
+        for bad in [
+            r#"{"keywords":["ok",{"a":1}]}"#,
+            r#"{"keywords":[["nested"]]}"#,
+            r#"{"keywords":[null]}"#,
+            r#"{"keywords":{"a":1}}"#,
+        ] {
+            let e = form(bad).unwrap_err();
+            assert_eq!(e.code(), "invalid_json", "{bad}");
+            assert_eq!(e.message, "keywords must be strings", "{bad}");
+        }
     }
 }

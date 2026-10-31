@@ -407,7 +407,11 @@ fn exact_terms(text: &str) -> usize {
     VOCAB_TERMS.iter().filter(|t| text.contains(**t)).count()
 }
 
-async fn vocab_text(app: &axum::Router, x_vocabulary: Option<&str>) -> String {
+async fn vocab_post(
+    app: &axum::Router,
+    x_vocabulary: Option<&str>,
+    extra: &[(&str, &str)],
+) -> (u16, String) {
     let wav = std::fs::read(VOCAB_WAV).unwrap();
     let mut fields: Vec<(&str, &[u8])> = vec![
         ("file", &wav),
@@ -418,6 +422,7 @@ async fn vocab_text(app: &axum::Router, x_vocabulary: Option<&str>) -> String {
     if let Some(v) = x_vocabulary {
         fields.push(("x_vocabulary", v.as_bytes()));
     }
+    fields.extend(extra.iter().map(|(k, v)| (*k, v.as_bytes())));
     let mut body = Vec::new();
     for (name, data) in fields {
         body.extend_from_slice(
@@ -436,9 +441,23 @@ async fn vocab_text(app: &axum::Router, x_vocabulary: Option<&str>) -> String {
         .body(Body::from(body))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), 200);
+    let status = resp.status().as_u16();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    String::from_utf8(bytes.to_vec()).unwrap()
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+async fn vocab_text_with(
+    app: &axum::Router,
+    x_vocabulary: Option<&str>,
+    extra: &[(&str, &str)],
+) -> String {
+    let (status, text) = vocab_post(app, x_vocabulary, extra).await;
+    assert_eq!(status, 200, "{text}");
+    text
+}
+
+async fn vocab_text(app: &axum::Router, x_vocabulary: Option<&str>) -> String {
+    vocab_text_with(app, x_vocabulary, &[]).await
 }
 
 #[tokio::test]
@@ -463,6 +482,95 @@ async fn vocabulary_default_profile_fixes_the_terms_and_none_does_not() {
         exact_terms(&none) < exact_terms(&with),
         "none was not measurably different: {none}"
     );
+}
+
+fn vocab_app(tag: &str) -> axum::Router {
+    let cfg = Config::load(std::path::Path::new(&format!(
+        "{FIXTURES}/test-config.toml"
+    )))
+    .unwrap();
+    router(app_state(cfg, tag, Arc::new(registry())))
+}
+
+fn keyword_fields() -> Vec<(&'static str, &'static str)> {
+    VOCAB_TERMS.iter().map(|t| ("keywords[]", *t)).collect()
+}
+
+#[tokio::test]
+#[ignore = "needs large-v3-turbo weights"]
+async fn keywords_fix_the_fixture_without_a_profile_like_a_list_prompt() {
+    if !enabled() {
+        return;
+    }
+    let _gate = GATE.lock().await;
+    let app = vocab_app("keywords-fixture");
+    let keywords = vocab_text_with(&app, Some("none"), &keyword_fields()).await;
+    let prompt = vocab_text_with(
+        &app,
+        Some("none"),
+        &[("prompt", "Oluwaseun, Ghidra, Yggdrasil, Zstandard")],
+    )
+    .await;
+    let none = vocab_text(&app, Some("none")).await;
+    eprintln!("keywords: {keywords}\nprompt: {prompt}\nnone: {none}");
+    assert_eq!(exact_terms(&keywords), 4, "keywords: {keywords}");
+    assert_eq!(keywords, prompt, "keywords and the same list as a prompt");
+    assert!(exact_terms(&none) < 4, "none alone: {none}");
+}
+
+#[tokio::test]
+#[ignore = "needs large-v3-turbo weights"]
+async fn keywords_stay_with_their_request_under_concurrency() {
+    if !enabled() {
+        return;
+    }
+    let _gate = GATE.lock().await;
+    let app = vocab_app("keywords-concurrent");
+    let with = keyword_fields();
+    let seq_with = vocab_text_with(&app, Some("none"), &with).await;
+    let seq_without = vocab_text_with(&app, Some("none"), &[]).await;
+    assert_eq!(exact_terms(&seq_with), 4, "{seq_with}");
+    assert!(exact_terms(&seq_without) < 4, "{seq_without}");
+    for round in 0..3 {
+        let a = {
+            let (app, with) = (app.clone(), with.clone());
+            tokio::spawn(async move { vocab_text_with(&app, Some("none"), &with).await })
+        };
+        let b = {
+            let app = app.clone();
+            tokio::spawn(async move { vocab_text_with(&app, Some("none"), &[]).await })
+        };
+        assert_eq!(a.await.unwrap(), seq_with, "round {round}: with keywords");
+        assert_eq!(
+            b.await.unwrap(),
+            seq_without,
+            "round {round}: without keywords"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs large-v3-turbo weights"]
+async fn keywords_over_the_prompt_window_return_400() {
+    if !enabled() {
+        return;
+    }
+    let _gate = GATE.lock().await;
+    let app = vocab_app("keywords-window");
+    let owned: Vec<String> = (0..100)
+        .map(|i| {
+            format!("{i:03}-{}", "qzxjkvw".repeat(6))
+                .chars()
+                .take(45)
+                .collect()
+        })
+        .collect();
+    let extra: Vec<(&str, &str)> = owned.iter().map(|k| ("keywords[]", k.as_str())).collect();
+    let (status, body) = vocab_post(&app, Some("none"), &extra).await;
+    assert_eq!(status, 400, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["error"]["code"], "keywords_too_long", "{body}");
+    assert_eq!(v["error"]["param"], "keywords", "{body}");
 }
 
 #[test]

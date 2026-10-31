@@ -26,7 +26,9 @@ use crate::jobs::JobManager;
 use crate::models::{ModelError, ModelInfo, OPENAI_ALIAS, Registry};
 use crate::pipeline::Transcription;
 use crate::scheduler::Lane;
-use crate::vocabulary::{VocabularyError, VocabularyStore};
+use crate::vocabulary::{
+    KeywordError, MAX_KEYWORDS, VocabularyError, VocabularyStore, request_keywords,
+};
 
 mod admin_routes;
 mod job_routes;
@@ -385,6 +387,7 @@ struct Form {
     response_format: Option<String>,
     temperature: Option<String>,
     granularities: Vec<String>,
+    keywords: Vec<String>,
     x_priority: Option<String>,
     x_vad: Option<String>,
     x_vocabulary: Option<String>,
@@ -430,6 +433,14 @@ async fn read_form(mut mp: Multipart, state: &AppState) -> Result<Form, ApiError
     let mut form = Form::default();
     let mut fields = 0usize;
     while let Some(mut field) = mp.next_field().await.map_err(multipart_error)? {
+        let name = field.name().unwrap_or_default().to_string();
+        if matches!(name.as_str(), "keywords[]" | "keywords") {
+            if form.keywords.len() >= MAX_KEYWORDS {
+                return Err(KeywordError::TooMany.into());
+            }
+            form.keywords.push(text_field(&mut field).await?);
+            continue;
+        }
         fields += 1;
         if fields > MAX_FORM_FIELDS {
             return Err(ApiError::new(
@@ -439,7 +450,6 @@ async fn read_form(mut mp: Multipart, state: &AppState) -> Result<Form, ApiError
                 format!("a request may carry at most {MAX_FORM_FIELDS} form fields"),
             ));
         }
-        let name = field.name().unwrap_or_default().to_string();
         match name.as_str() {
             "file" => {
                 let _permit = state
@@ -599,6 +609,7 @@ fn validate_fields(form: Form) -> Result<ParsedRequest, ApiError> {
         }
     };
     validate_granularities(&form.granularities, format)?;
+    let keywords = request_keywords(&form.keywords)?;
     let lane = match form.x_priority.as_deref().map(str::trim) {
         None | Some("") | Some("interactive") => Lane::Interactive,
         Some("batch") => Lane::Batch,
@@ -641,6 +652,7 @@ fn validate_fields(form: Form) -> Result<ParsedRequest, ApiError> {
             language,
             prompt,
             vocabulary: Vec::new(),
+            keywords,
             temperature,
             vad,
         },
@@ -670,6 +682,16 @@ fn audio_error(e: AudioError) -> ApiError {
 impl From<VocabularyError> for ApiError {
     fn from(e: VocabularyError) -> Self {
         ApiError::invalid("x_vocabulary", "invalid_value", e.to_string())
+    }
+}
+
+impl From<KeywordError> for ApiError {
+    fn from(e: KeywordError) -> Self {
+        let code = match e {
+            KeywordError::TooMany => "too_many_keywords",
+            _ => "invalid_value",
+        };
+        ApiError::invalid("keywords", code, e.to_string())
     }
 }
 
@@ -720,6 +742,9 @@ fn engine_error(e: EngineError, request_id: &str) -> ApiError {
             "request_cancelled",
             e.to_string(),
         ),
+        EngineError::KeywordsTooLong { .. } => {
+            ApiError::invalid("keywords", "keywords_too_long", e.to_string())
+        }
         EngineError::Run(detail) => {
             let detail = strip_paths(&detail);
             tracing::warn!(request_id, detail = %detail, "transcription failed");
@@ -1332,6 +1357,220 @@ mod tests {
             vec![],
         ];
         assert_eq!(seen, want);
+    }
+
+    /// Records (profile terms, keywords) per decode; fails with `KeywordsTooLong` when `refuse` is set.
+    struct KeywordRecorder {
+        seen: std::sync::Mutex<Vec<(Vec<String>, Vec<String>)>>,
+        refuse: bool,
+    }
+
+    impl Transcriber for KeywordRecorder {
+        fn transcribe(
+            &self,
+            _m: &ModelRef,
+            _a: &[f32],
+            o: &DecodeOptions,
+        ) -> Result<Transcription, EngineError> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((o.vocabulary.clone(), o.keywords.clone()));
+            if self.refuse {
+                return Err(EngineError::KeywordsTooLong {
+                    needed: 300,
+                    limit: 223,
+                });
+            }
+            Ok(Transcription::default())
+        }
+    }
+
+    fn keyword_app(tag: &str, refuse: bool) -> (Router, Arc<KeywordRecorder>) {
+        let cfg = Config::from_toml(
+            "[vocabulary.default]\nterms = [\"Kubernetes\", \"Grafana\"]\n[vocabulary.legal]\nterms = [\"estoppel\"]\n",
+        )
+        .unwrap();
+        let rec = Arc::new(KeywordRecorder {
+            seen: Default::default(),
+            refuse,
+        });
+        let vocab = VocabularyStore::new(&cfg.vocabulary);
+        (router(test_state(tag, cfg, rec.clone(), vocab)), rec)
+    }
+
+    fn refs(owned: &[(String, Vec<u8>)]) -> Vec<(&str, &[u8])> {
+        owned
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn keywords_in_both_field_spellings_reach_the_engine_trimmed_and_deduped() {
+        let (app, rec) = keyword_app("kw-spell", false);
+        let f = wav(16000, 32000);
+        let (s, v, _) = call(
+            app,
+            multipart(&[
+                ("file", &f),
+                ("model", b"whisper-1"),
+                ("keywords[]", b"  Ghidra "),
+                ("keywords", b"Zstandard"),
+                ("keywords[]", b"ghidra"),
+                ("keywords[]", b"Yggdrasil"),
+            ]),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let seen = rec.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].1, ["Ghidra", "Zstandard", "Yggdrasil"]);
+    }
+
+    #[tokio::test]
+    async fn keywords_leave_the_profile_resolution_unchanged() {
+        let (app, rec) = keyword_app("kw-profile", false);
+        let f = wav(16000, 32000);
+        for val in [None, Some(&b"none"[..]), Some(b"legal")] {
+            let mut fields: Vec<(&str, &[u8])> = vec![
+                ("file", &f),
+                ("model", b"whisper-1"),
+                ("keywords[]", b"Ghidra"),
+            ];
+            if let Some(v) = val {
+                fields.push(("x_vocabulary", v));
+            }
+            let (s, v, _) = call(app.clone(), multipart(&fields)).await;
+            assert_eq!(s, StatusCode::OK, "{v}");
+        }
+        let kw = vec!["Ghidra".to_string()];
+        let want: Vec<(Vec<String>, Vec<String>)> = vec![
+            (vec!["Kubernetes".into(), "Grafana".into()], kw.clone()),
+            (vec![], kw.clone()),
+            (vec!["estoppel".into()], kw),
+        ];
+        assert_eq!(*rec.seen.lock().unwrap(), want);
+    }
+
+    #[tokio::test]
+    async fn requests_without_keywords_carry_none() {
+        let (app, rec) = keyword_app("kw-none", false);
+        let f = wav(16000, 32000);
+        let (s, _, _) = call(app, multipart(&[("file", &f), ("model", b"whisper-1")])).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(rec.seen.lock().unwrap()[0].1.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_hundred_keywords_with_every_normal_field_is_accepted() {
+        let (app, rec) = keyword_app("kw-100", false);
+        let f = wav(16000, 32000);
+        let mut owned: Vec<(String, Vec<u8>)> = vec![
+            ("file".into(), f),
+            ("model".into(), b"whisper-1".to_vec()),
+            ("language".into(), b"en".to_vec()),
+            ("prompt".into(), b"hello".to_vec()),
+            ("response_format".into(), b"verbose_json".to_vec()),
+            ("temperature".into(), b"0.2".to_vec()),
+            ("timestamp_granularities[]".into(), b"word".to_vec()),
+            ("timestamp_granularities[]".into(), b"segment".to_vec()),
+            ("x_priority".into(), b"batch".to_vec()),
+            ("x_vad".into(), b"false".to_vec()),
+            ("x_vocabulary".into(), b"none".to_vec()),
+        ];
+        for i in 0..100 {
+            owned.push(("keywords[]".into(), format!("term{i}").into_bytes()));
+        }
+        let (s, v, _) = call(app, multipart(&refs(&owned))).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(rec.seen.lock().unwrap()[0].1.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn a_hundred_and_first_keyword_is_400_too_many_keywords() {
+        let (app, rec) = keyword_app("kw-101", false);
+        let f = wav(16000, 32000);
+        for name in ["keywords[]", "keywords"] {
+            let mut owned: Vec<(String, Vec<u8>)> = vec![
+                ("model".into(), b"whisper-1".to_vec()),
+                ("file".into(), f.clone()),
+            ];
+            for i in 0..101 {
+                owned.push((name.into(), format!("term{i}").into_bytes()));
+            }
+            let (s, v, _) = call(app.clone(), multipart(&refs(&owned))).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{name}");
+            assert_envelope(&v, "too_many_keywords");
+            assert_eq!(v["error"]["param"], "keywords");
+            assert_eq!(v["error"]["type"], "invalid_request_error");
+            assert_eq!(
+                v["error"]["message"],
+                "a request may carry at most 100 keywords"
+            );
+        }
+        assert!(rec.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_keywords_are_400_invalid_value_with_param_keywords() {
+        let (app, rec) = keyword_app("kw-bad", false);
+        let f = wav(16000, 32000);
+        let long = "x".repeat(51);
+        for (bad, message) in [
+            (&b""[..], "keywords[1] is empty"),
+            (b"  ", "keywords[1] is empty"),
+            (
+                b"a<b",
+                "keywords[1] must not contain '<', '>', line breaks or other control characters",
+            ),
+            (
+                b"two\nlines",
+                "keywords[1] must not contain '<', '>', line breaks or other control characters",
+            ),
+            (long.as_bytes(), "keywords[1] is longer than 50 characters"),
+        ] {
+            let (s, v, _) = call(
+                app.clone(),
+                multipart(&[
+                    ("file", &f),
+                    ("model", b"whisper-1"),
+                    ("keywords[]", b"ok"),
+                    ("keywords[]", bad),
+                ]),
+            )
+            .await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{bad:?}");
+            assert_envelope(&v, "invalid_value");
+            assert_eq!(v["error"]["param"], "keywords");
+            assert_eq!(v["error"]["message"], message);
+        }
+        assert!(rec.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn keywords_the_engine_cannot_fit_are_400_keywords_too_long() {
+        let (app, rec) = keyword_app("kw-long", true);
+        let f = wav(16000, 32000);
+        let (s, v, text) = call(
+            app,
+            multipart(&[
+                ("file", &f),
+                ("model", b"whisper-1"),
+                ("keywords[]", b"Ghidra"),
+            ]),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{text}");
+        assert_envelope(&v, "keywords_too_long");
+        assert_eq!(v["error"]["param"], "keywords");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            v["error"]["message"],
+            "keywords and prompt need 300 prompt tokens; the model keeps at most 223"
+        );
+        assert!(!text.contains("Ghidra"));
+        assert_eq!(rec.seen.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1949,6 +2188,81 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         j.state.jobs.stop();
+    }
+
+    #[tokio::test]
+    async fn multipart_job_keywords_are_validated_and_stored_in_the_job_options() {
+        let j = jobs_app("kw-upload", false);
+        let f = wav(16000, 32000);
+        let submit = |fields: Vec<(&str, &[u8])>| {
+            let mut req = multipart(&fields);
+            *req.uri_mut() = "/hark/v1/jobs".parse().unwrap();
+            call(j.app.clone(), req)
+        };
+        let (s, v, _) = submit(vec![
+            ("file", &f),
+            ("model", b"whisper-1"),
+            ("keywords[]", b" Ghidra "),
+            ("keywords[]", b"ghidra"),
+            ("keywords[]", b"Zstandard"),
+        ])
+        .await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+        let rec = j.state.jobs.get(v["id"].as_str().unwrap()).unwrap();
+        assert_eq!(rec.options.keywords, ["Ghidra", "Zstandard"]);
+        assert!(!v.to_string().contains("Ghidra"), "{v}");
+
+        let (s, v, _) = submit(vec![
+            ("file", &f),
+            ("model", b"whisper-1"),
+            ("keywords[]", b"a>b"),
+        ])
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_envelope(&v, "invalid_value");
+        assert_eq!(v["error"]["param"], "keywords");
+    }
+
+    #[tokio::test]
+    async fn json_job_keywords_are_validated_and_stored_in_the_job_options() {
+        let j = jobs_app("kw-json", false);
+        let path = j.root.join("a.wav").display().to_string();
+        let (s, v, _) = call(
+            j.app.clone(),
+            json_post(
+                "/hark/v1/jobs",
+                json!({"path": path, "model": "whisper-1", "keywords": ["Ghidra", "Zstandard"]}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+        let rec = j.state.jobs.get(v["id"].as_str().unwrap()).unwrap();
+        assert_eq!(rec.options.keywords, ["Ghidra", "Zstandard"]);
+
+        let many: Vec<String> = (0..101).map(|i| format!("term{i}")).collect();
+        let (s, v, _) = call(
+            j.app.clone(),
+            json_post(
+                "/hark/v1/jobs",
+                json!({"path": path, "model": "whisper-1", "keywords": many}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_envelope(&v, "too_many_keywords");
+        assert_eq!(v["error"]["param"], "keywords");
+
+        let (s, v, _) = call(
+            j.app.clone(),
+            json_post(
+                "/hark/v1/jobs",
+                json!({"path": path, "model": "whisper-1", "keywords": ["ok", "a<b"]}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_envelope(&v, "invalid_value");
+        assert_eq!(v["error"]["param"], "keywords");
     }
 
     #[cfg(unix)]

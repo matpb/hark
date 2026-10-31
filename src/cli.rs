@@ -15,6 +15,8 @@ pub struct SubmitArgs {
     pub language: Option<String>,
     pub format: Option<String>,
     pub vocabulary: Option<String>,
+    /// Request `keywords`, one per `--keyword`.
+    pub keywords: Vec<String>,
 }
 
 pub struct TranscribeArgs {
@@ -24,6 +26,8 @@ pub struct TranscribeArgs {
     /// `json`, `text`, `srt`, `vtt` or `verbose_json`; `text` when unset.
     pub format: Option<String>,
     pub vocabulary: Option<String>,
+    /// Request `keywords`, one per `--keyword`.
+    pub keywords: Vec<String>,
     /// `interactive` or `batch`.
     pub priority: Option<String>,
 }
@@ -92,10 +96,7 @@ impl Client {
         }
         let req = self.request("POST", "/hark/v1/jobs")?;
         let res = if under_roots(&file, &self.roots) {
-            let mut body = json!({"path": file.display().to_string()});
-            for (k, v) in &fields {
-                body[*k] = json!(v);
-            }
+            let body = job_json_body(&file.display().to_string(), &fields, &a.keywords);
             req.set("Content-Type", "application/json")
                 .send_bytes(body.to_string().as_bytes())
         } else {
@@ -105,6 +106,7 @@ impl Client {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "audio".into());
             let boundary = "hark-boundary-7f3a9c1e5b2d";
+            fields.extend(keyword_fields(&a.keywords));
             req.set(
                 "Content-Type",
                 &format!("multipart/form-data; boundary={boundary}"),
@@ -140,6 +142,7 @@ impl Client {
                 fields.push((name, v.clone()));
             }
         }
+        fields.extend(keyword_fields(&a.keywords));
         let name = a
             .file
             .file_name()
@@ -289,7 +292,7 @@ pub fn transcribe_local(cfg: &Config, a: &TranscribeArgs) -> anyhow::Result<Stri
     };
     use crate::models::Registry;
     use crate::scheduler::Lane;
-    use crate::vocabulary::VocabularyStore;
+    use crate::vocabulary::{VocabularyStore, request_keywords};
 
     let format = a.format.as_deref().unwrap_or("text");
     if !["json", "text", "srt", "vtt", "verbose_json"].contains(&format) {
@@ -305,6 +308,7 @@ pub fn transcribe_local(cfg: &Config, a: &TranscribeArgs) -> anyhow::Result<Stri
     {
         bail!("`{l}` is not a supported ISO-639-1 language code");
     }
+    let keywords = request_keywords(&a.keywords).map_err(|e| anyhow::anyhow!("{e}"))?;
     let registry = Registry::from_config(cfg);
     let model_id = a
         .model
@@ -327,6 +331,7 @@ pub fn transcribe_local(cfg: &Config, a: &TranscribeArgs) -> anyhow::Result<Stri
     let opts = DecodeOptions {
         language: a.language.clone(),
         vocabulary,
+        keywords,
         ..DecodeOptions::default()
     };
     let engine = WhisperEngine::from_config(cfg, &registry);
@@ -464,6 +469,23 @@ pub fn error_message(body: &str) -> String {
         .unwrap_or_else(|| body.trim().to_string())
 }
 
+/// The JSON jobs body: the path, the text fields, and `keywords` as an array when there are any.
+fn job_json_body(path: &str, fields: &[(&str, String)], keywords: &[String]) -> Value {
+    let mut body = json!({"path": path});
+    for (k, v) in fields {
+        body[*k] = json!(v);
+    }
+    if !keywords.is_empty() {
+        body["keywords"] = json!(keywords);
+    }
+    body
+}
+
+/// One `keywords[]` multipart field per term.
+fn keyword_fields(keywords: &[String]) -> impl Iterator<Item = (&'static str, String)> + '_ {
+    keywords.iter().map(|k| ("keywords[]", k.clone()))
+}
+
 pub fn multipart_body(
     boundary: &str,
     fields: &[(&str, String)],
@@ -533,6 +555,32 @@ mod tests {
         ));
         assert!(s.contains("name=\"file\"; filename=\"a_b.wav\""));
         assert!(s.ends_with("DATA\r\n--B--\r\n"));
+    }
+
+    #[test]
+    fn keywords_go_out_as_one_keywords_field_per_term() {
+        let terms = vec!["Ghidra".to_string(), "Zstandard".to_string()];
+        let mut fields: Vec<(&str, String)> = vec![("model", "whisper-1".into())];
+        fields.extend(keyword_fields(&terms));
+        let s = String::from_utf8(multipart_body("B", &fields, "a.wav", b"D")).unwrap();
+        assert!(s.contains("name=\"keywords[]\"\r\n\r\nGhidra\r\n"));
+        assert!(s.contains("name=\"keywords[]\"\r\n\r\nZstandard\r\n"));
+        assert!(s.find("Ghidra").unwrap() < s.find("Zstandard").unwrap());
+        assert_eq!(keyword_fields(&[]).count(), 0);
+    }
+
+    #[test]
+    fn the_json_jobs_body_carries_keywords_as_an_array() {
+        let fields = vec![("model", "whisper-1".to_string())];
+        let terms = vec!["Ghidra".to_string(), "Zstandard".to_string()];
+        assert_eq!(
+            job_json_body("/a.wav", &fields, &terms),
+            json!({"path": "/a.wav", "model": "whisper-1", "keywords": ["Ghidra", "Zstandard"]})
+        );
+        assert_eq!(
+            job_json_body("/a.wav", &fields, &[]),
+            json!({"path": "/a.wav", "model": "whisper-1"})
+        );
     }
 
     #[test]

@@ -97,6 +97,11 @@ pub enum ChunkFailure {
     DeviceFault(String),
     /// A graph failure that may be one-off: the chunk is retried once on the same device.
     Transient(String),
+    /// The keywords and prompt do not fit whisper's prompt window: a client error, never retried or recorded.
+    KeywordsTooLong {
+        needed: usize,
+        limit: usize,
+    },
     Failed(String),
 }
 
@@ -1201,6 +1206,14 @@ impl Core {
                     self.record_error(msg.clone());
                     let _ = item.reply.send(Err(EngineError::Run(msg)));
                 }
+            }
+            Err(ChunkFailure::KeywordsTooLong { needed, limit }) => {
+                let reply = if cancelled {
+                    EngineError::Cancelled
+                } else {
+                    EngineError::KeywordsTooLong { needed, limit }
+                };
+                let _ = item.reply.send(Err(reply));
             }
             Err(ChunkFailure::Failed(msg)) => {
                 self.record_error(msg.clone());
@@ -3238,6 +3251,58 @@ mod tests {
         let s = core.status(DeviceStatus::default());
         assert!(!s.degraded, "a transient failure never degrades");
         assert!(load_action(&core.dispatch()).is_none());
+    }
+
+    #[test]
+    fn keywords_too_long_is_replied_once_and_never_retried_or_recorded() {
+        let mut core = ready_core(1, 16);
+        let rx = put(&mut core, "a", Lane::Interactive, 0);
+        assert_eq!(started(&core.dispatch()), vec![0]);
+        core.on_finished(
+            0,
+            Err(ChunkFailure::KeywordsTooLong {
+                needed: 300,
+                limit: 223,
+            }),
+            0.0,
+        );
+        let err = rx.try_recv().unwrap().unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::KeywordsTooLong {
+                needed: 300,
+                limit: 223
+            }
+        ));
+        assert!(rx.try_recv().is_err(), "one reply only");
+        let actions = core.dispatch();
+        assert!(started(&actions).is_empty(), "the chunk is not retried");
+        assert!(load_action(&actions).is_none(), "no device fallback");
+        let s = core.status(DeviceStatus::default());
+        assert!(s.last_error.is_none(), "not recorded as an error");
+        assert!(!s.degraded);
+        assert_eq!(s.models[0].states, 1, "the state stays usable");
+    }
+
+    #[test]
+    fn keywords_too_long_on_a_cancelled_chunk_replies_cancelled() {
+        let mut core = ready_core(1, 16);
+        let rx = put(&mut core, "a", Lane::Interactive, 0);
+        core.dispatch();
+        let flag = match &core.slots[0] {
+            Slot::Running(r) => r.item.cancel.clone(),
+            _ => unreachable!(),
+        };
+        flag.store(true, Ordering::SeqCst);
+        core.on_finished(
+            0,
+            Err(ChunkFailure::KeywordsTooLong {
+                needed: 300,
+                limit: 223,
+            }),
+            0.0,
+        );
+        assert!(matches!(rx.try_recv(), Ok(Err(EngineError::Cancelled))));
     }
 
     #[test]

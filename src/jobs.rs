@@ -71,6 +71,9 @@ pub struct JobOptions {
     pub language: Option<String>,
     pub prompt: Option<String>,
     pub vocabulary: Vec<String>,
+    /// Request `keywords`; absent in job.json written before they existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keywords: Vec<String>,
     pub temperature: f32,
     pub vad: Option<bool>,
     pub granularities: Vec<String>,
@@ -83,6 +86,7 @@ impl JobOptions {
             language: self.language.clone(),
             prompt: self.prompt.clone(),
             vocabulary: self.vocabulary.clone(),
+            keywords: self.keywords.clone(),
             temperature: self.temperature,
             vad: self.vad,
         }
@@ -1067,6 +1071,7 @@ mod tests {
             language: None,
             prompt: None,
             vocabulary: vec!["Kubernetes".into()],
+            keywords: Vec::new(),
             temperature: 0.0,
             vad: None,
             granularities: Vec::new(),
@@ -1506,6 +1511,88 @@ mod tests {
             .unwrap();
         let done = wait_for(&m, &rec.id, Status::Failed);
         assert!(done.error.unwrap().contains("could not decode"));
+        assert!(matches!(m.result(&rec.id), Err(JobError::Failed(_))));
+        m.stop();
+    }
+
+    const OPTIONS_1_1_1: &str = r#"{"model":"base","language":null,"prompt":null,"vocabulary":["Kubernetes"],"temperature":0.0,"vad":null,"granularities":[],"response_format":null}"#;
+
+    #[test]
+    fn job_options_from_1_1_1_load_without_keywords_and_serialise_unchanged() {
+        let o: JobOptions = serde_json::from_str(OPTIONS_1_1_1).unwrap();
+        assert!(o.keywords.is_empty());
+        assert_eq!(o, opts());
+        assert_eq!(serde_json::to_string(&o).unwrap(), OPTIONS_1_1_1);
+        assert!(o.decode_options().keywords.is_empty());
+    }
+
+    #[test]
+    fn job_options_keywords_round_trip_and_reach_the_decode_options() {
+        let mut o = opts();
+        o.keywords = vec!["Ghidra".into(), "Zstandard".into()];
+        let json = serde_json::to_string(&o).unwrap();
+        assert!(json.contains(r#""keywords":["Ghidra","Zstandard"]"#));
+        let back: JobOptions = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, o);
+        assert_eq!(back.decode_options().keywords, ["Ghidra", "Zstandard"]);
+    }
+
+    /// Fake engine that records the keywords it is given and refuses them as too long.
+    struct Refusing {
+        seen: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl Transcriber for Refusing {
+        fn transcribe(
+            &self,
+            _m: &ModelRef,
+            _a: &[f32],
+            o: &DecodeOptions,
+        ) -> Result<Transcription, EngineError> {
+            self.seen.lock().unwrap().push(o.keywords.clone());
+            Err(EngineError::KeywordsTooLong {
+                needed: 300,
+                limit: 223,
+            })
+        }
+    }
+
+    #[test]
+    fn a_job_whose_keywords_do_not_fit_fails_with_the_message() {
+        let eng = Arc::new(Refusing {
+            seen: Mutex::new(Vec::new()),
+        });
+        let (m, base) = manager("keywords-long", eng.clone());
+        let wav = base.join("k.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(&wav, spec).unwrap();
+        for _ in 0..(16000 * 3) {
+            w.write_sample(0i16).unwrap();
+        }
+        w.finalize().unwrap();
+        m.start();
+        let mut o = opts();
+        o.keywords = vec!["Ghidra".into()];
+        let rec = m
+            .submit(
+                "job_kkkkkkkkkkkkkkkk".into(),
+                o,
+                Source::Path {
+                    path: wav.display().to_string(),
+                },
+            )
+            .unwrap();
+        let done = wait_for(&m, &rec.id, Status::Failed);
+        assert_eq!(
+            done.error.as_deref(),
+            Some("keywords and prompt need 300 prompt tokens; the model keeps at most 223")
+        );
+        assert_eq!(*eng.seen.lock().unwrap(), [vec!["Ghidra".to_string()]]);
         assert!(matches!(m.result(&rec.id), Err(JobError::Failed(_))));
         m.stop();
     }

@@ -46,6 +46,9 @@ enum Command {
         format: Option<String>,
         #[arg(long)]
         vocabulary: Option<String>,
+        /// A term to recognise in this request (repeatable); added to the --vocabulary profile.
+        #[arg(long = "keyword", value_name = "TERM")]
+        keywords: Vec<String>,
         /// interactive (default) or batch.
         #[arg(long)]
         priority: Option<String>,
@@ -124,6 +127,9 @@ enum JobsCommand {
         format: Option<String>,
         #[arg(long)]
         vocabulary: Option<String>,
+        /// A term to recognise in this request (repeatable); added to the --vocabulary profile.
+        #[arg(long = "keyword", value_name = "TERM")]
+        keywords: Vec<String>,
     },
     /// List jobs, newest first.
     List {
@@ -272,6 +278,7 @@ async fn run() -> anyhow::Result<()> {
             language,
             format,
             vocabulary,
+            keywords,
             priority,
             local,
             config,
@@ -282,6 +289,7 @@ async fn run() -> anyhow::Result<()> {
                 language,
                 format,
                 vocabulary,
+                keywords,
                 priority,
             };
             tokio::task::spawn_blocking(move || {
@@ -381,12 +389,14 @@ fn run_jobs(config: Option<PathBuf>, command: JobsCommand) -> anyhow::Result<()>
             language,
             format,
             vocabulary,
+            keywords,
         } => client.submit(&SubmitArgs {
             file,
             model,
             language,
             format,
             vocabulary,
+            keywords,
         })?,
         JobsCommand::List { status } => client.list(status.as_deref())?,
         JobsCommand::Get { id } => client.get(&id)?,
@@ -403,6 +413,48 @@ fn run_jobs(config: Option<PathBuf>, command: JobsCommand) -> anyhow::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyword_is_repeatable_on_transcribe_and_jobs_submit() {
+        let cli = Cli::try_parse_from([
+            "hark",
+            "transcribe",
+            "a.wav",
+            "--keyword",
+            "Ghidra",
+            "--keyword",
+            "Zstandard",
+        ])
+        .unwrap();
+        let Command::Transcribe { keywords, .. } = cli.command else {
+            panic!("not transcribe");
+        };
+        assert_eq!(keywords, ["Ghidra", "Zstandard"]);
+        let cli = Cli::try_parse_from([
+            "hark",
+            "jobs",
+            "submit",
+            "a.wav",
+            "--keyword",
+            "Ghidra",
+            "--vocabulary",
+            "none",
+        ])
+        .unwrap();
+        let Command::Jobs {
+            command: JobsCommand::Submit { keywords, .. },
+            ..
+        } = cli.command
+        else {
+            panic!("not jobs submit");
+        };
+        assert_eq!(keywords, ["Ghidra"]);
+        let cli = Cli::try_parse_from(["hark", "transcribe", "a.wav"]).unwrap();
+        let Command::Transcribe { keywords, .. } = cli.command else {
+            panic!("not transcribe");
+        };
+        assert!(keywords.is_empty());
+    }
 
     #[test]
     fn models_pull_takes_an_id_or_defaults_but_not_both_or_neither() {

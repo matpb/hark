@@ -200,7 +200,7 @@ class Summary(unittest.TestCase):
         ])
         self.assertEqual([g["status"] for g in q.eval_gates(gates, s)], ["FAIL", "FAIL", "FAIL"])
         self.assertIs(q.sends_vocabulary("memo"), False)
-        for profile in ("dictation", "meeting", "default"):
+        for profile in ("dictation", "meeting", "default", "keywords"):
             self.assertIs(q.sends_vocabulary(profile), True)
 
 
@@ -212,6 +212,18 @@ class Requests(unittest.TestCase):
         self.assertEqual(q.hark_fields("meeting", "V"), base + [("prompt", "V"), ("x_vocabulary", "none"), ("x_priority", "batch")])
         self.assertEqual(q.hark_fields("memo", "V"), base + [("x_vocabulary", "none"), ("x_priority", "batch")])
         self.assertEqual(q.hark_fields("default", "V"), base)
+
+    def test_keywords_profile_sends_each_term_as_a_keywords_field(self):
+        fields = q.hark_fields("keywords", "A, B,\nC")
+        self.assertEqual([v for k, v in fields if k == "keywords[]"], ["A", "B", "C"])
+        self.assertNotIn("prompt", [k for k, _ in fields])
+        self.assertIn(("x_vocabulary", "none"), fields)
+        self.assertIn(("x_vad", "false"), fields)
+        dictation = q.hark_fields("dictation", "V")
+        self.assertEqual([f for f in fields if f[0] != "keywords[]"], [f for f in dictation if f[0] != "prompt"])
+        self.assertEqual(q.hark_fields("keywords", " , ,\n"), [f for f in dictation if f[0] != "prompt"])
+        rest = [f for f in dictation if f[0] != "prompt"]
+        self.assertEqual(q.hark_fields("keywords", "Solo"), rest[:4] + [("keywords[]", "Solo")] + rest[4:])
 
     def test_multipart(self):
         body, ctype = q.build_multipart([("a", "1")], "x.wav", b"RIFF")

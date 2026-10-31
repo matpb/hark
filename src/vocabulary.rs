@@ -26,6 +26,49 @@ pub enum VocabularyError {
     Unknown(String),
 }
 
+pub const MAX_KEYWORDS: usize = 100;
+pub const MAX_KEYWORD_CHARS: usize = 50;
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum KeywordError {
+    #[error("a request may carry at most {MAX_KEYWORDS} keywords")]
+    TooMany,
+    #[error("keywords[{0}] is empty")]
+    Empty(usize),
+    #[error("keywords[{0}] must not contain '<', '>', line breaks or other control characters")]
+    Forbidden(usize),
+    #[error("keywords[{0}] is longer than {MAX_KEYWORD_CHARS} characters")]
+    TooLong(usize),
+}
+
+/// Trimmed request keywords in order, later duplicates ignoring case dropped (first spelling kept).
+pub fn request_keywords(raw: &[String]) -> Result<Vec<String>, KeywordError> {
+    if raw.len() > MAX_KEYWORDS {
+        return Err(KeywordError::TooMany);
+    }
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(raw.len());
+    for (i, item) in raw.iter().enumerate() {
+        let term = item.trim();
+        if term.is_empty() {
+            return Err(KeywordError::Empty(i));
+        }
+        if term
+            .chars()
+            .any(|c| matches!(c, '<' | '>' | '\u{2028}' | '\u{2029}') || c.is_control())
+        {
+            return Err(KeywordError::Forbidden(i));
+        }
+        if term.chars().count() > MAX_KEYWORD_CHARS {
+            return Err(KeywordError::TooLong(i));
+        }
+        if seen.insert(term.to_lowercase()) {
+            out.push(term.to_string());
+        }
+    }
+    Ok(out)
+}
+
 type Stamp = Option<(SystemTime, u64)>;
 
 fn stamp(path: &Path) -> Stamp {
@@ -393,6 +436,124 @@ mod tests {
         assert_eq!(
             store.resolve(None).unwrap(),
             s(&["Alpha", "Omega", "Beta", "Delta", "Epsilon", "Zeta", "Eta"])
+        );
+    }
+
+    #[test]
+    fn keywords_are_trimmed_in_order_and_deduped_ignoring_case() {
+        assert_eq!(
+            request_keywords(&s(&["  Ghidra ", "ghidra", "Zstandard"])),
+            Ok(s(&["Ghidra", "Zstandard"]))
+        );
+        assert_eq!(request_keywords(&[]), Ok(Vec::new()));
+        assert_eq!(
+            request_keywords(&s(&["Ünï", "ÜNÏ", "b"])),
+            Ok(s(&["Ünï", "b"]))
+        );
+        assert_eq!(
+            request_keywords(&s(&["two words", "TWO WORDS"])),
+            Ok(s(&["two words"]))
+        );
+    }
+
+    #[test]
+    fn keywords_reject_angle_brackets_and_control_characters() {
+        assert_eq!(
+            request_keywords(&s(&["a<b"])),
+            Err(KeywordError::Forbidden(0))
+        );
+        assert_eq!(
+            request_keywords(&s(&["a>b"])),
+            Err(KeywordError::Forbidden(0))
+        );
+        assert_eq!(
+            request_keywords(&s(&["ok", "x\ny"])),
+            Err(KeywordError::Forbidden(1))
+        );
+        for bad in [
+            "x\ry",
+            "x\ty",
+            "x\0y",
+            "x\u{7f}y",
+            "x\u{85}y",
+            "x\u{2028}y",
+            "x\u{2029}y",
+        ] {
+            assert_eq!(
+                request_keywords(&s(&["ok", bad])),
+                Err(KeywordError::Forbidden(1)),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            request_keywords(&s(&["\nok\t"])),
+            Ok(s(&["ok"])),
+            "edges are trimmed first"
+        );
+    }
+
+    #[test]
+    fn keywords_reject_empty_items_by_their_received_index() {
+        assert_eq!(
+            request_keywords(&s(&["ok", "  "])),
+            Err(KeywordError::Empty(1))
+        );
+        assert_eq!(request_keywords(&s(&[""])), Err(KeywordError::Empty(0)));
+        assert_eq!(
+            request_keywords(&s(&["a", "A", "", "b"])),
+            Err(KeywordError::Empty(2)),
+            "the index counts dropped duplicates"
+        );
+    }
+
+    #[test]
+    fn keywords_length_is_counted_in_characters_and_capped_at_50() {
+        assert_eq!(
+            request_keywords(&s(&[&"x".repeat(50)])),
+            Ok(s(&[&"x".repeat(50)]))
+        );
+        assert_eq!(
+            request_keywords(&s(&[&"x".repeat(51)])),
+            Err(KeywordError::TooLong(0))
+        );
+        assert!(
+            request_keywords(&s(&[&"é".repeat(50)])).is_ok(),
+            "50 chars, 100 bytes"
+        );
+        assert_eq!(
+            request_keywords(&s(&["ok", &"é".repeat(51)])),
+            Err(KeywordError::TooLong(1))
+        );
+        assert!(request_keywords(&s(&[&format!("  {}  ", "x".repeat(50))])).is_ok());
+    }
+
+    #[test]
+    fn keywords_count_is_capped_at_100_before_any_item_is_checked() {
+        let hundred: Vec<String> = (0..100).map(|i| format!("term{i}")).collect();
+        assert_eq!(request_keywords(&hundred).unwrap().len(), 100);
+        let mut many = hundred.clone();
+        many.push("term100".into());
+        assert_eq!(request_keywords(&many), Err(KeywordError::TooMany));
+        many[0] = "<".into();
+        assert_eq!(request_keywords(&many), Err(KeywordError::TooMany));
+        let same = vec!["a".to_string(); 101];
+        assert_eq!(request_keywords(&same), Err(KeywordError::TooMany));
+    }
+
+    #[test]
+    fn keyword_errors_read_as_the_api_messages() {
+        assert_eq!(
+            KeywordError::TooMany.to_string(),
+            "a request may carry at most 100 keywords"
+        );
+        assert_eq!(KeywordError::Empty(3).to_string(), "keywords[3] is empty");
+        assert_eq!(
+            KeywordError::Forbidden(2).to_string(),
+            "keywords[2] must not contain '<', '>', line breaks or other control characters"
+        );
+        assert_eq!(
+            KeywordError::TooLong(1).to_string(),
+            "keywords[1] is longer than 50 characters"
         );
     }
 

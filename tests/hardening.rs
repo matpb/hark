@@ -41,6 +41,7 @@ fn job_json(id: &str, status: &str) -> String {
             language: None,
             prompt: None,
             vocabulary: Vec::new(),
+            keywords: Vec::new(),
             temperature: 0.0,
             vad: None,
             granularities: Vec::new(),

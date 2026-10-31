@@ -17,7 +17,7 @@ import wave
 from collections import Counter
 from pathlib import Path
 
-PROFILES = ("dictation", "meeting", "memo", "default")
+PROFILES = ("dictation", "meeting", "memo", "default", "keywords")
 KINDS = ("vocab", "silence", "speech")
 GATE_KEYS = (
     "vocab_recall_min",
@@ -119,11 +119,15 @@ def hark_fields(profile: str, vocabulary: str) -> list[tuple[str, str]]:
         ("timestamp_granularities[]", "word"),
     ]
     # dictation: a dictation app; meeting: a meeting app; memo: a memo bot; default: bare request
-    if profile in ("dictation", "meeting", "memo"):
-        if profile != "memo":
+    # keywords: dictation with the vocabulary as keywords[] fields instead of a prompt
+    if profile in ("dictation", "meeting", "memo", "keywords"):
+        if profile == "keywords":
+            terms = (t.strip() for t in vocabulary.replace("\n", ",").split(","))
+            fields += [("keywords[]", t) for t in terms if t]
+        elif profile != "memo":
             fields.append(("prompt", vocabulary))
         fields.append(("x_vocabulary", "none"))
-        if profile == "dictation":
+        if profile in ("dictation", "keywords"):
             fields.append(("x_vad", "false"))
         fields.append(("x_priority", "batch"))
     return fields
@@ -329,7 +333,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--cli-model", help="whisper-cli model path")
     ap.add_argument("--cli-bin", default="whisper-cli")
     ap.add_argument("--cli-args", default="", help="extra whisper-cli args, split with shlex")
-    ap.add_argument("--profile", choices=PROFILES, default="dictation", help="request shape of a client: dictation app, meeting app, memo bot, or default")
+    ap.add_argument("--profile", choices=PROFILES, default="dictation", help="request shape of a client: dictation app, meeting app, memo bot, default, or keywords (dictation with keywords[] instead of a prompt)")
     ap.add_argument("--prompt", help="overrides the manifest vocabulary in the request prompt")
     ap.add_argument("--kinds", default=",".join(KINDS), help="comma list of vocab,silence,speech")
     ap.add_argument("--no-tails", action="store_true", help="skip tail variants")
@@ -363,7 +367,7 @@ def run(args: argparse.Namespace) -> int:
     cli_extra = shlex.split(args.cli_args)
     fields = hark_fields(args.profile, vocabulary)
     fields += [tuple(f.split("=", 1)) for f in args.field]
-    cli_prompt = vocabulary if args.profile in ("dictation", "meeting") else None
+    cli_prompt = vocabulary if args.profile in ("dictation", "meeting", "keywords") else None
     jobs = 1 if args.engine == "whisper-cli" else max(1, args.jobs)
 
     def transcribe(wav: Path) -> str:
