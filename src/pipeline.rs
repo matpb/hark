@@ -670,6 +670,56 @@ pub fn collapsed_runs(segments: &[Segment], min_words: usize) -> Vec<(f64, usize
         .collect()
 }
 
+/// `seg` with only `words`: text rebuilt from them (leading space kept), end moved to the last word.
+pub fn with_words(seg: Segment, words: Vec<Word>) -> Segment {
+    let lead = if seg.text.starts_with(char::is_whitespace) {
+        " "
+    } else {
+        ""
+    };
+    let joined: Vec<&str> = words.iter().map(|w| w.word.as_str()).collect();
+    let text = format!("{lead}{}", joined.join(" "));
+    let end = words.last().map_or(seg.end, |w| w.end);
+    Segment {
+        text,
+        end,
+        words,
+        ..seg
+    }
+}
+
+/// Longest junction overlap `junction_overlap` looks for.
+const JUNCTION_MAX_WORDS: usize = 6;
+
+fn normalized(w: &Word) -> String {
+    w.word
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Words at the end of `kept` repeated at the start of `next`, compared lowercase with
+/// non-alphanumerics stripped; the longest match up to 6 words, 0 when none.
+pub fn junction_overlap(kept: &[Word], next: &[Word]) -> usize {
+    let tail: Vec<String> = kept[kept.len().saturating_sub(JUNCTION_MAX_WORDS)..]
+        .iter()
+        .map(normalized)
+        .collect();
+    let head: Vec<String> = next
+        .iter()
+        .take(JUNCTION_MAX_WORDS)
+        .map(normalized)
+        .collect();
+    (1..=tail.len().min(head.len()))
+        .rev()
+        .find(|&k| {
+            let t = &tail[tail.len() - k..];
+            t == &head[..k] && t.iter().all(|w| !w.is_empty())
+        })
+        .unwrap_or(0)
+}
+
 /// Removes words of collapsed runs starting at or after `chunk_end - COLLAPSED_TAIL_SECS`; returns words removed.
 /// Segments that lose every word are removed; partly emptied segments are rebuilt from their kept words.
 pub fn drop_collapsed_tail(segments: Vec<Segment>, chunk_end: f64) -> (Vec<Segment>, usize) {
@@ -701,20 +751,7 @@ pub fn drop_collapsed_tail(segments: Vec<Segment>, chunk_end: f64) -> (Vec<Segme
                 .filter(|(_, d)| !**d)
                 .map(|(w, _)| w.clone())
                 .collect();
-            let lead = if seg.text.starts_with(char::is_whitespace) {
-                " "
-            } else {
-                ""
-            };
-            let joined: Vec<&str> = words.iter().map(|w| w.word.as_str()).collect();
-            let text = format!("{lead}{}", joined.join(" "));
-            let end = words.last().map_or(seg.end, |w| w.end);
-            out.push(Segment {
-                text,
-                end,
-                words,
-                ..seg
-            });
+            out.push(with_words(seg, words));
         }
     }
     (out, removed)
@@ -1468,6 +1505,65 @@ mod tests {
         assert_eq!(damage(&[timed(&same_time(50.0, 8))]), 8);
         let both = [timed(&repeated), timed(&same_time(50.0, 8))];
         assert_eq!(damage(&both), 19);
+    }
+
+    fn plain(words: &[&str]) -> Vec<Word> {
+        words
+            .iter()
+            .map(|w| Word {
+                word: (*w).into(),
+                start: 0.0,
+                end: 0.0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn junction_overlap_matches_normalized_words_and_takes_the_longest() {
+        assert_eq!(
+            junction_overlap(&plain(&["logs,", "and"]), &plain(&["and", "create", "a"])),
+            1
+        );
+        assert_eq!(
+            junction_overlap(
+                &plain(&["fully", "resolved."]),
+                &plain(&["Fully", "resolved", "And"])
+            ),
+            2
+        );
+        assert_eq!(junction_overlap(&plain(&["one"]), &plain(&["two"])), 0);
+        assert_eq!(
+            junction_overlap(&plain(&["a", "b", "a"]), &plain(&["a", "b", "a", "c"])),
+            3
+        );
+        assert_eq!(
+            junction_overlap(&plain(&["x", "a"]), &plain(&["a", "x", "a"])),
+            1
+        );
+    }
+
+    #[test]
+    fn junction_overlap_edges() {
+        assert_eq!(junction_overlap(&[], &plain(&["a"])), 0);
+        assert_eq!(junction_overlap(&plain(&["a"]), &[]), 0);
+        assert_eq!(
+            junction_overlap(&plain(&["..."]), &plain(&["--"])),
+            0,
+            "empty forms never match"
+        );
+        assert_eq!(
+            junction_overlap(&plain(&["ok", "..."]), &plain(&["...", "go"])),
+            0
+        );
+        let long = vec!["la"; 8];
+        assert_eq!(
+            junction_overlap(&plain(&long), &plain(&long)),
+            6,
+            "capped at 6"
+        );
+        let big: Vec<String> = (0..100_000).map(|i| format!("w{i}")).collect();
+        let big_words: Vec<Word> = plain(&big.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(junction_overlap(&big_words, &big_words[99_997..]), 3);
     }
 
     #[test]

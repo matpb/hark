@@ -1332,8 +1332,8 @@ pub fn repair_start(segments: &[Segment], chunk_start_secs: f64) -> Option<f64> 
     Some((earliest - REPAIR_LEAD_SECS).max(chunk_start_secs))
 }
 
-/// Original segments before `from`, then `repaired`, then the originals that start after the repair
-/// ends when it stops more than a second short of `chunk_end` (speech past the looped span).
+/// Originals before `from` trimmed to the cut, then `repaired` minus words repeated at the junction,
+/// then originals starting after the repair when it stops over 1 s short of `chunk_end`.
 pub fn splice_repair(
     original: Vec<Segment>,
     repaired: Vec<Segment>,
@@ -1357,17 +1357,41 @@ pub fn splice_repair(
     } else {
         Vec::new()
     };
-    let mut out: Vec<Segment> = original.into_iter().filter(|s| s.start < from).collect();
-    for s in &mut out {
+    let mut out: Vec<Segment> = Vec::new();
+    for mut s in original.into_iter().filter(|s| s.start < from) {
         if s.end > cut {
+            let had_words = !s.words.is_empty();
             s.end = cut.max(s.start);
             s.words.retain(|w| w.start < cut);
             for w in &mut s.words {
                 w.end = w.end.min(cut);
             }
+            if had_words {
+                if s.words.is_empty() {
+                    continue;
+                }
+                let words = std::mem::take(&mut s.words);
+                s = pipeline::with_words(s, words);
+            }
+        }
+        out.push(s);
+    }
+    let kept_words: Vec<pipeline::Word> = out.iter().flat_map(|s| s.words.clone()).collect();
+    let repaired_words: Vec<pipeline::Word> =
+        repaired.iter().flat_map(|s| s.words.clone()).collect();
+    let mut to_drop = pipeline::junction_overlap(&kept_words, &repaired_words);
+    for mut s in repaired {
+        let n = s.words.len();
+        if to_drop == 0 || n == 0 {
+            out.push(s);
+        } else if n > to_drop {
+            let words = s.words.split_off(to_drop);
+            to_drop = 0;
+            out.push(pipeline::with_words(s, words));
+        } else {
+            to_drop -= n;
         }
     }
-    out.extend(repaired);
     out.extend(tail);
     out
 }
@@ -1854,5 +1878,95 @@ mod tests {
             2,
             "a repair reaching the chunk end keeps no tail"
         );
+    }
+
+    /// Words (text, start) each ending 0.2 s after their start.
+    fn timed_words<'a>(words: &[(&'a str, f64)]) -> Vec<(&'a str, f64, f64)> {
+        words.iter().map(|&(w, s)| (w, s, s + 0.2)).collect()
+    }
+
+    fn joined_text(segs: &[Segment]) -> String {
+        segs.iter().map(|s| s.text.as_str()).collect::<String>()
+    }
+
+    #[test]
+    fn splice_rebuilds_the_text_of_a_trimmed_segment() {
+        let first = [
+            ("Look", 80.0),
+            ("at", 80.3),
+            ("the", 80.5),
+            ("logs,", 80.8),
+            ("and", 83.6),
+            ("create", 83.9),
+            ("a", 84.1),
+            ("testing", 84.3),
+            ("harness", 84.7),
+            ("until", 85.2),
+            ("this", 85.5),
+            ("is", 85.7),
+            ("fully", 85.9),
+            ("resolved.", 86.3),
+        ];
+        let mut straddling = seg_with_words(&timed_words(&first));
+        straddling.text =
+            " Look at the logs, and create a testing harness until this is fully resolved.".into();
+        straddling.start = 80.0;
+        straddling.end = 86.5;
+        let mut rep_a = seg_with_words(&timed_words(&first[4..]));
+        rep_a.text = " and create a testing harness until this is fully resolved.".into();
+        rep_a.start = 83.5;
+        rep_a.end = 86.6;
+        let mut rep_b = seg_with_words(&timed_words(&[
+            ("And", 86.8),
+            ("I", 87.0),
+            ("really", 87.1),
+            ("want", 87.3),
+            ("to", 87.5),
+            ("keep", 87.6),
+            ("using", 87.8),
+            ("Hark.", 87.9),
+        ]));
+        rep_b.text = " And I really want to keep using Hark.".into();
+        rep_b.start = 86.8;
+        rep_b.end = 88.0;
+        let out = splice_repair(vec![straddling], vec![rep_a, rep_b], 83.5, 111.9);
+        let text = joined_text(&out);
+        assert_eq!(
+            text.trim(),
+            "Look at the logs, and create a testing harness until this is fully resolved. And I really want to keep using Hark."
+        );
+        assert_eq!(text.matches("create a testing harness").count(), 1);
+        assert_eq!(out[0].words.len(), 4);
+        assert!(out[0].end <= out[1].start, "no overlap after the splice");
+    }
+
+    #[test]
+    fn splice_drops_words_repeated_at_the_junction() {
+        let kept = seg_with_words(&[("We", 1.0, 1.2), ("should", 1.4, 1.6), ("ship", 3.9, 4.1)]);
+        let mut rep = seg_with_words(&[("ship", 4.0, 4.2), ("it", 4.3, 4.4), ("today.", 4.5, 5.0)]);
+        rep.text = " ship it today.".into();
+        let out = splice_repair(vec![kept], vec![rep], 3.5, 5.0);
+        assert_eq!(joined_text(&out), "We should ship it today.");
+    }
+
+    #[test]
+    fn splice_drops_a_repaired_segment_made_only_of_repeated_words() {
+        let kept = seg_with_words(&[("one", 1.0, 1.2), ("two", 1.4, 1.6)]);
+        let mut a = seg_with_words(&[("one", 1.5, 1.6)]);
+        a.text = " one".into();
+        let mut b = seg_with_words(&[("two", 1.7, 1.8), ("three", 2.0, 2.2)]);
+        b.text = " two three".into();
+        let out = splice_repair(vec![kept], vec![a, b], 1.4, 2.2);
+        assert_eq!(joined_text(&out), "one two three");
+    }
+
+    #[test]
+    fn splice_drops_a_straddling_segment_whose_words_all_start_after_the_cut() {
+        let mut early = seg_with_words(&[("late", 5.0, 5.2), ("words", 5.4, 5.6)]);
+        early.start = 4.2;
+        let rep = seg_with_words(&[("fresh", 4.0, 5.9)]);
+        let out = splice_repair(vec![early], vec![rep], 4.5, 6.0);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "fresh");
     }
 }
