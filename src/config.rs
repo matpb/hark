@@ -5,6 +5,8 @@ use std::str::FromStr;
 
 use serde::Deserialize;
 
+use crate::pipeline::PromptStyle;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("cannot read config {0}: {1}")]
@@ -113,6 +115,8 @@ pub struct EngineConfig {
     pub gpu_retry_secs: u64,
     /// Decoded chunks after which the GPU device is recreated to free driver bookkeeping; 0 = never.
     pub recycle_after_chunks: u64,
+    /// How vocabulary terms are written into the initial prompt: `sentence` or `list`.
+    pub vocabulary_prompt: PromptStyle,
 }
 
 impl Default for EngineConfig {
@@ -127,6 +131,7 @@ impl Default for EngineConfig {
             cpu_threads: 8,
             gpu_retry_secs: 600,
             recycle_after_chunks: 500,
+            vocabulary_prompt: PromptStyle::default(),
         }
     }
 }
@@ -634,6 +639,22 @@ mod tests {
         assert!(Config::from_toml("[jobs]\nffmpeg_timeout_secs = 0").is_err());
         assert!(Config::from_toml("[jobs]\nkeep_results_days = 0").is_err());
         assert!(Config::from_toml("[jobs]\nkeep_results_days = 1").is_ok());
+    }
+
+    #[test]
+    fn vocabulary_prompt_defaults_to_sentence_and_rejects_unknown_values() {
+        assert_eq!(
+            Config::default().engine.vocabulary_prompt,
+            PromptStyle::Sentence
+        );
+        let c = Config::from_toml("[engine]\nvocabulary_prompt = \"list\"").unwrap();
+        assert_eq!(c.engine.vocabulary_prompt, PromptStyle::List);
+        let c = Config::from_toml("[engine]\nvocabulary_prompt = \"sentence\"").unwrap();
+        assert_eq!(c.engine.vocabulary_prompt, PromptStyle::Sentence);
+        let e = Config::from_toml("[engine]\nvocabulary_prompt = \"csv\"").unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("vocabulary_prompt"), "{msg}");
+        assert!(msg.contains("unknown variant `csv`"), "{msg}");
     }
 
     #[test]

@@ -208,6 +208,7 @@ The config file lives at the path in the table above (`~/.config/hark/config.tom
 | `cpu_threads` | `8` | Threads for CPU decoding and the CPU fallback. |
 | `gpu_retry_secs` | `600` | After a CPU fallback, an idle hark reloads the active model on the original GPU this often. Success clears `degraded`; failure stays on CPU. `0` never retries. |
 | `recycle_after_chunks` | `500` | After this many decoded chunks, hark reloads the model on a fresh GPU device at the next idle moment (past twice the count it stops starting new chunks until the running ones finish). This keeps the GPU driver's memory flat over days of use. `hark status` shows the recycle count. `0` never recycles. |
+| `vocabulary_prompt` | `"sentence"` | How vocabulary terms are written into whisper's initial prompt: `"sentence"` ("We talked about A, B and C.") or `"list"` ("A, B, C"). |
 
 hark falls back to CPU when the GPU runs out of memory, during a run or while loading a model. Other decode failures retry the chunk once on the same device, then fail the request. While on CPU `/health` reports `degraded`, and every `gpu_retry_secs` an idle hark tries the GPU again.
 
@@ -228,6 +229,8 @@ hark falls back to CPU when the GPU runs out of memory, during a run or while lo
 |---|---|---|
 | `enabled` | `true` | Trim silence with the Silero VAD model before decoding. Near-silent input returns empty text instead of a hallucination. Per request: `x_vad`. |
 | `model` | `"ggml-silero-v5.1.2.bin"` | VAD model file name, searched in `models.dir` and `models.extra_dirs`. |
+
+With the VAD model present, every request runs the VAD, even with `x_vad=false` (which only skips trimming the silences before decoding). Audio with no speech returns no text, and text decoded where no speech was detected is removed. The check uses its own, more sensitive speech regions, so a short word such as "Cool" after a pause is kept.
 
 ### `[jobs]`
 
@@ -371,7 +374,7 @@ Set `RUST_LOG=debug` (a systemd drop-in, the plist's `EnvironmentVariables`, or 
 
 ## Vocabulary profiles
 
-A profile is a list of terms, joined with `, ` and placed at the start of whisper's initial prompt on every chunk, followed by the request's own `prompt`. If the result is too long for whisper's prompt limit, terms are dropped from the end and the request prompt is kept whole.
+A profile is a list of terms, written as "We talked about A, B and C." at the start of whisper's initial prompt on every chunk, followed by the request's own `prompt`. Whisper recognizes terms better from a sentence than from a bare comma list; set `engine.vocabulary_prompt = "list"` to get `A, B, C` instead. When the request's `prompt` is itself a comma list of two or more terms, its terms join the same sentence. If the result is too long for whisper's prompt limit, profile terms are dropped from the end and the request prompt is kept whole. Text that only repeats a run of the prompt's terms is removed from the result.
 
 ```toml
 [vocabulary.default]

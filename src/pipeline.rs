@@ -90,26 +90,86 @@ impl Span {
     }
 }
 
-/// Vocabulary terms joined with ", ", then the request prompt. Over `limit` tokens (as `count`
-/// measures them; whisper.cpp keeps `n_text_ctx / 2`), terms drop from the end, the prompt stays whole.
+/// How vocabulary terms are written into whisper's initial prompt.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptStyle {
+    #[default]
+    Sentence,
+    List,
+}
+
+/// "We talked about A, B and C." One term: "We talked about A." Two: "We talked about A and B." No terms: "".
+pub fn sentence(terms: &[String]) -> String {
+    let Some((last, head)) = terms.split_last() else {
+        return String::new();
+    };
+    let mut out = String::from("We talked about ");
+    if !head.is_empty() {
+        out.push_str(&head.join(", "));
+        out.push_str(" and ");
+    }
+    out.push_str(last);
+    out.push('.');
+    out
+}
+
+/// Vocabulary terms, then the request prompt, in `style`. Over `limit` tokens (as `count` measures them),
+/// profile terms drop from the end; the request prompt, or its term list, stays whole.
 pub fn build_initial_prompt(
     terms: &[String],
     request: Option<&str>,
+    style: PromptStyle,
     limit: usize,
     count: &dyn Fn(&str) -> usize,
 ) -> Option<String> {
     let request = request.map(str::trim).filter(|p| !p.is_empty());
-    let compose = |n: usize| -> String {
-        let mut parts = Vec::new();
-        if n > 0 {
-            parts.push(terms[..n].join(", "));
-        }
-        if let Some(p) = request {
-            parts.push(p.to_string());
-        }
-        parts.join(" ")
+    let request_terms = match style {
+        PromptStyle::Sentence => request
+            .map(prompt_terms)
+            .filter(|t| t.len() >= 2)
+            .unwrap_or_default(),
+        PromptStyle::List => Vec::new(),
     };
-    let (mut lo, mut hi) = (0usize, terms.len());
+    let profile: Vec<String> = if request_terms.is_empty() {
+        terms.to_vec()
+    } else {
+        let lower: Vec<String> = request_terms.iter().map(|t| t.to_lowercase()).collect();
+        terms
+            .iter()
+            .filter(|t| !lower.contains(&t.to_lowercase()))
+            .cloned()
+            .collect()
+    };
+    let compose = |n: usize| -> String {
+        match style {
+            PromptStyle::List => {
+                let mut parts = Vec::new();
+                if n > 0 {
+                    parts.push(profile[..n].join(", "));
+                }
+                if let Some(p) = request {
+                    parts.push(p.to_string());
+                }
+                parts.join(" ")
+            }
+            PromptStyle::Sentence if !request_terms.is_empty() => {
+                let all: Vec<String> = profile[..n].iter().chain(&request_terms).cloned().collect();
+                sentence(&all)
+            }
+            PromptStyle::Sentence => {
+                let mut parts = Vec::new();
+                if n > 0 {
+                    parts.push(sentence(&profile[..n]));
+                }
+                if let Some(p) = request {
+                    parts.push(p.to_string());
+                }
+                parts.join(" ")
+            }
+        }
+    };
+    let (mut lo, mut hi) = (0usize, profile.len());
     if hi > 0 && count(&compose(hi)) <= limit {
         lo = hi;
     }
@@ -123,6 +183,75 @@ pub fn build_initial_prompt(
     }
     let prompt = compose(lo);
     (!prompt.is_empty()).then_some(prompt)
+}
+
+/// Byte length of the prefix of `text` that equals `term` ignoring case, if any.
+fn match_len(text: &str, term: &str) -> Option<usize> {
+    let mut chars = text.char_indices();
+    for t in term.chars() {
+        let (_, c) = chars.next()?;
+        if !c.to_lowercase().eq(t.to_lowercase()) {
+            return None;
+        }
+    }
+    Some(chars.next().map_or(text.len(), |(i, _)| i))
+}
+
+/// Rewrites whole-word, case-insensitive matches of `terms` to their spelling, only for terms with an
+/// uppercase letter after the first ("OKAPI", "DataGrid"); "Laravel" or "tmux" stay as decoded.
+pub fn canonical_case(text: &str, terms: &[String]) -> String {
+    let mut mixed: Vec<&str> = terms
+        .iter()
+        .map(|t| t.trim())
+        .filter(|t| t.chars().skip(1).any(char::is_uppercase))
+        .collect();
+    if mixed.is_empty() {
+        return text.to_string();
+    }
+    mixed.sort_by_key(|t| std::cmp::Reverse(t.chars().count()));
+    let mut out = String::with_capacity(text.len());
+    let mut prev_alnum = false;
+    let mut i = 0;
+    while i < text.len() {
+        let rest = &text[i..];
+        let found = if prev_alnum {
+            None
+        } else {
+            mixed.iter().find_map(|t| {
+                let n = match_len(rest, t)?;
+                let after_ok = !rest[n..].chars().next().is_some_and(char::is_alphanumeric);
+                after_ok.then_some((n, *t))
+            })
+        };
+        if let Some((n, t)) = found {
+            out.push_str(t);
+            i += n;
+            prev_alnum = true;
+            continue;
+        }
+        let Some(c) = rest.chars().next() else { break };
+        out.push(c);
+        prev_alnum = c.is_alphanumeric();
+        i += c.len_utf8();
+    }
+    out
+}
+
+/// Terms of a prompt that is a plain list (items split on ',' and '\n', 1 to 4 words, at most 40
+/// chars, not ending in '.', '?' or '!'); an empty Vec when any item fails that, as for prose.
+pub fn prompt_terms(prompt: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    for item in prompt.split([',', '\n']).map(str::trim) {
+        if item.is_empty() {
+            continue;
+        }
+        let words = item.split_whitespace().count();
+        if words > 4 || item.chars().count() > 40 || item.ends_with(['.', '?', '!']) {
+            return Vec::new();
+        }
+        terms.push(item.to_string());
+    }
+    terms
 }
 
 /// Padded, merged and split VAD regions (centiseconds) as sorted, disjoint spans.
@@ -958,22 +1087,27 @@ mod tests {
     #[test]
     fn initial_prompt_orders_terms_before_the_request_prompt() {
         let big = usize::MAX;
-        assert_eq!(build_initial_prompt(&[], None, big, &words_count), None);
         assert_eq!(
-            build_initial_prompt(&[], Some("  "), big, &words_count),
+            build_initial_prompt(&[], None, PromptStyle::List, big, &words_count),
             None
         );
         assert_eq!(
-            build_initial_prompt(&[], Some("hello"), big, &words_count).as_deref(),
+            build_initial_prompt(&[], Some("  "), PromptStyle::List, big, &words_count),
+            None
+        );
+        assert_eq!(
+            build_initial_prompt(&[], Some("hello"), PromptStyle::List, big, &words_count)
+                .as_deref(),
             Some("hello")
         );
         let terms = vec!["Kubernetes".to_string(), "Grafana".to_string()];
         assert_eq!(
-            build_initial_prompt(&terms, Some("hello"), big, &words_count).as_deref(),
+            build_initial_prompt(&terms, Some("hello"), PromptStyle::List, big, &words_count)
+                .as_deref(),
             Some("Kubernetes, Grafana hello")
         );
         assert_eq!(
-            build_initial_prompt(&terms, None, big, &words_count).as_deref(),
+            build_initial_prompt(&terms, None, PromptStyle::List, big, &words_count).as_deref(),
             Some("Kubernetes, Grafana")
         );
     }
@@ -981,7 +1115,8 @@ mod tests {
     #[test]
     fn initial_prompt_drops_terms_from_the_end_and_keeps_the_request_whole() {
         let terms: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
-        let p = |limit, req| build_initial_prompt(&terms, req, limit, &words_count);
+        let p =
+            |limit, req| build_initial_prompt(&terms, req, PromptStyle::List, limit, &words_count);
         assert_eq!(p(4, None).as_deref(), Some("a, b, c, d"));
         assert_eq!(p(3, None).as_deref(), Some("a, b, c"));
         assert_eq!(p(1, None).as_deref(), Some("a"));
@@ -2063,5 +2198,181 @@ mod tests {
             (per_group + 1) * piece + per_group * kept > MAX_CHUNK,
             "one more piece must not fit"
         );
+    }
+
+    fn strs(t: &[&str]) -> Vec<String> {
+        t.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn sentence_writes_zero_to_three_and_more_terms() {
+        assert_eq!(sentence(&[]), "");
+        assert_eq!(sentence(&strs(&["A"])), "We talked about A.");
+        assert_eq!(sentence(&strs(&["A", "B"])), "We talked about A and B.");
+        assert_eq!(
+            sentence(&strs(&["A", "B", "C"])),
+            "We talked about A, B and C."
+        );
+        assert_eq!(
+            sentence(&strs(&["A", "B", "C", "D"])),
+            "We talked about A, B, C and D."
+        );
+    }
+
+    #[test]
+    fn sentence_prompt_writes_profile_terms_as_a_sentence() {
+        let s = |terms: &[&str], req| {
+            build_initial_prompt(
+                &strs(terms),
+                req,
+                PromptStyle::Sentence,
+                usize::MAX,
+                &words_count,
+            )
+        };
+        assert_eq!(
+            s(&["OKAPI", "Laravel"], None).as_deref(),
+            Some("We talked about OKAPI and Laravel.")
+        );
+        assert_eq!(
+            s(&[], Some("OKAPI, Laravel, Priya")).as_deref(),
+            Some("We talked about OKAPI, Laravel and Priya.")
+        );
+        assert_eq!(
+            s(&["DataGrid", "OKAPI"], Some("okapi, Laravel")).as_deref(),
+            Some("We talked about DataGrid, okapi and Laravel.")
+        );
+        assert_eq!(
+            s(&["OKAPI"], Some("Hello there. This is earlier text.")).as_deref(),
+            Some("We talked about OKAPI. Hello there. This is earlier text.")
+        );
+        assert_eq!(s(&[], Some("hello")).as_deref(), Some("hello"));
+        assert_eq!(
+            s(&["OKAPI"], Some("hello")).as_deref(),
+            Some("We talked about OKAPI. hello"),
+            "a single-item request prompt is not a term list"
+        );
+        assert_eq!(s(&[], Some("  ")), None);
+        assert_eq!(s(&[], None), None);
+    }
+
+    #[test]
+    fn sentence_prompt_drops_profile_terms_from_the_end_and_keeps_request_terms() {
+        let terms = strs(&["a", "b", "c", "d"]);
+        let p = |limit, req| {
+            build_initial_prompt(&terms, req, PromptStyle::Sentence, limit, &words_count)
+        };
+        assert_eq!(
+            p(10, Some("x, y")).as_deref(),
+            Some("We talked about a, b, c, d, x and y.")
+        );
+        assert_eq!(
+            p(9, Some("x, y")).as_deref(),
+            Some("We talked about a, b, c, x and y.")
+        );
+        assert_eq!(
+            p(4, Some("x, y")).as_deref(),
+            Some("We talked about x and y."),
+            "request terms are never dropped"
+        );
+        assert_eq!(
+            p(0, Some("x, y")).as_deref(),
+            Some("We talked about x and y.")
+        );
+        assert_eq!(
+            p(8, None).as_deref(),
+            Some("We talked about a, b, c and d.")
+        );
+        assert_eq!(p(7, None).as_deref(), Some("We talked about a, b and c."));
+        assert_eq!(p(6, None).as_deref(), Some("We talked about a and b."));
+        assert_eq!(p(4, None).as_deref(), Some("We talked about a."));
+        assert_eq!(p(3, None), None);
+        assert_eq!(
+            p(5, Some("x y")).as_deref(),
+            Some("x y"),
+            "a prose request prompt stays whole"
+        );
+        assert_eq!(p(6, Some("x y")).as_deref(), Some("We talked about a. x y"));
+    }
+
+    #[test]
+    fn list_prompt_leaves_a_request_term_list_alone() {
+        let terms = strs(&["OKAPI"]);
+        assert_eq!(
+            build_initial_prompt(
+                &terms,
+                Some("okapi, Laravel"),
+                PromptStyle::List,
+                usize::MAX,
+                &words_count
+            )
+            .as_deref(),
+            Some("OKAPI okapi, Laravel")
+        );
+    }
+
+    #[test]
+    fn prompt_style_deserializes_lowercase() {
+        #[derive(serde::Deserialize)]
+        struct W {
+            s: PromptStyle,
+        }
+        let w: W = toml::from_str("s = \"list\"").unwrap();
+        assert_eq!(w.s, PromptStyle::List);
+        let w: W = toml::from_str("s = \"sentence\"").unwrap();
+        assert_eq!(w.s, PromptStyle::Sentence);
+        assert!(toml::from_str::<W>("s = \"List\"").is_err());
+        assert_eq!(PromptStyle::default(), PromptStyle::Sentence);
+    }
+
+    #[test]
+    fn prompt_terms_splits_a_term_list() {
+        assert_eq!(
+            prompt_terms("OKAPI, Laravel, Priya"),
+            vec!["OKAPI", "Laravel", "Priya"]
+        );
+        assert_eq!(
+            prompt_terms("OKAPI, examplecorp.com, Priya"),
+            vec!["OKAPI", "examplecorp.com", "Priya"]
+        );
+        assert_eq!(prompt_terms("OKAPI\nLaravel"), vec!["OKAPI", "Laravel"]);
+        assert_eq!(prompt_terms("a,, b ,\n"), vec!["a", "b"]);
+        assert!(prompt_terms("Ana and Priya discuss OKAPI.").is_empty());
+        assert!(prompt_terms("").is_empty());
+        assert!(prompt_terms("OKAPI, one two three four five").is_empty());
+        assert!(prompt_terms(&format!("OKAPI, {}", "x".repeat(41))).is_empty());
+        assert_eq!(prompt_terms(&"x".repeat(40)).len(), 1);
+        assert!(prompt_terms("OKAPI, ok?").is_empty());
+        assert!(prompt_terms("OKAPI, ok!").is_empty());
+    }
+
+    #[test]
+    fn canonical_case_restores_mixed_case_terms_at_word_boundaries() {
+        assert_eq!(
+            canonical_case(
+                "the Okapi web and okapi-design, Okapi's docs",
+                &strs(&["OKAPI"])
+            ),
+            "the OKAPI web and OKAPI-design, OKAPI's docs"
+        );
+        assert_eq!(
+            canonical_case("datagrid rocks", &strs(&["DataGrid"])),
+            "DataGrid rocks"
+        );
+        assert_eq!(canonical_case("Okapiano", &strs(&["OKAPI"])), "Okapiano");
+        assert_eq!(canonical_case("aOkapi", &strs(&["OKAPI"])), "aOkapi");
+        assert_eq!(canonical_case(" okapi", &strs(&["OKAPI"])), " OKAPI");
+        assert_eq!(canonical_case("okapi", &strs(&["OKAPI"])), "OKAPI");
+        assert_eq!(canonical_case("", &strs(&["OKAPI"])), "");
+    }
+
+    #[test]
+    fn canonical_case_leaves_sentence_case_terms_alone() {
+        let t = strs(&["Laravel", "hark", "tmux"]);
+        assert_eq!(
+            canonical_case("Laravel and laravel, Hark TMUX", &t),
+            "Laravel and laravel, Hark TMUX"
+        );
+        assert_eq!(canonical_case("Okapi", &[]), "Okapi");
     }
 }

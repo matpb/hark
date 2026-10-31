@@ -25,6 +25,7 @@ idle_unload_secs = 900           # 0 = never unload
 cpu_threads = 8
 gpu_retry_secs = 600             # after a GPU fallback, retry the GPU this often when idle; 0 = never
 recycle_after_chunks = 500       # recreate the GPU device after this many decoded chunks to bound driver memory; 0 = never
+vocabulary_prompt = "sentence"   # "sentence" writes terms as "We talked about A, B and C."; "list" writes "A, B, C"
 
 [models]
 dir = "~/.local/share/hark/models"

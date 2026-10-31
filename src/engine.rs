@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 #[cfg(any(feature = "vulkan", feature = "metal"))]
 use std::ffi::CStr;
 use std::path::PathBuf;
@@ -12,10 +12,12 @@ use whisper_rs::{
     WhisperVadContextParams, WhisperVadParams,
 };
 
-use crate::config::{Config, Device};
+use crate::config::{Config, Device, EngineConfig};
+use crate::guard;
 use crate::models::Registry;
 use crate::pipeline::{
-    self, ChunkReport, MAX_CHUNK, MIN_ADVANCE, MIN_CHUNK, Segment, Span, TokenInfo, Transcription,
+    self, ChunkReport, MAX_CHUNK, MIN_ADVANCE, MIN_CHUNK, PromptStyle, Segment, Span, TokenInfo,
+    Transcription,
 };
 use crate::scheduler::{
     Backend, ChunkFailure, ChunkOut, ChunkRequest, ChunkTask, DeviceStatus, Lane, LoadReport,
@@ -370,6 +372,7 @@ pub struct WhisperBackend {
     retrying: AtomicBool,
     fell_back_from: Mutex<Option<String>>,
     cpu_threads: i32,
+    prompt_style: PromptStyle,
     word_timestamps: BTreeMap<String, String>,
     loaded: RwLock<Option<Arc<Loaded>>>,
     parked: Mutex<Vec<ParkedModel>>,
@@ -475,6 +478,7 @@ impl WhisperBackend {
     fn new(
         pick: DevicePick,
         cpu_threads: i32,
+        prompt_style: PromptStyle,
         word_timestamps: BTreeMap<String, String>,
     ) -> WhisperBackend {
         WhisperBackend {
@@ -483,6 +487,7 @@ impl WhisperBackend {
             retrying: AtomicBool::new(false),
             fell_back_from: Mutex::new(None),
             cpu_threads,
+            prompt_style,
             word_timestamps,
             loaded: RwLock::new(None),
             parked: Mutex::new(Vec::new()),
@@ -825,6 +830,7 @@ impl Backend for WhisperBackend {
                 &task.opts,
                 task.language.as_deref(),
                 threads,
+                self.prompt_style,
                 abort,
             )
             .map(|mut out| {
@@ -844,6 +850,7 @@ impl Backend for WhisperBackend {
                 &task.opts,
                 task.language.as_deref(),
                 threads,
+                self.prompt_style,
                 abort,
             )
         };
@@ -880,6 +887,7 @@ pub struct WhisperEngine<B: Backend = WhisperBackend> {
     vad_default: bool,
     vad: VadPool<Box<WhisperVadContext>>,
     vad_failed: AtomicBool,
+    prompt_style: PromptStyle,
 }
 
 struct VadConfig {
@@ -892,6 +900,7 @@ impl WhisperEngine {
         Self::build(
             device,
             cpu_threads,
+            EngineConfig::default().vocabulary_prompt,
             sched_cfg,
             BTreeMap::new(),
             VadConfig {
@@ -904,6 +913,7 @@ impl WhisperEngine {
     fn build(
         device: Device,
         cpu_threads: i32,
+        prompt_style: PromptStyle,
         sched_cfg: SchedulerConfig,
         word_timestamps: BTreeMap<String, String>,
         vad: VadConfig,
@@ -923,7 +933,7 @@ impl WhisperEngine {
                 tracing::info!(device = %format!("gpu:{index}"), name = %name, "engine device")
             }
         }
-        let backend = WhisperBackend::new(pick.clone(), cpu_threads, word_timestamps);
+        let backend = WhisperBackend::new(pick.clone(), cpu_threads, prompt_style, word_timestamps);
         WhisperEngine {
             pick,
             sched: Scheduler::new(backend, sched_cfg),
@@ -931,6 +941,7 @@ impl WhisperEngine {
             vad_default: vad.default,
             vad: VadPool::new(),
             vad_failed: AtomicBool::new(false),
+            prompt_style,
         }
     }
 
@@ -943,6 +954,7 @@ impl WhisperEngine {
         let engine = Self::build(
             cfg.engine.device,
             cfg.engine.cpu_threads,
+            cfg.engine.vocabulary_prompt,
             SchedulerConfig {
                 states: cfg.engine.states,
                 max_interactive_waiting: cfg.server.max_interactive_waiting,
@@ -981,6 +993,7 @@ impl<B: Backend> WhisperEngine<B> {
             vad_default: false,
             vad: VadPool::new(),
             vad_failed: AtomicBool::new(false),
+            prompt_style: PromptStyle::default(),
         }
     }
 
@@ -1002,8 +1015,8 @@ impl<B: Backend> WhisperEngine<B> {
         }
     }
 
-    /// Speech regions in centiseconds, or `None` when VAD is unavailable or failed.
-    fn detect_speech(&self, audio: &[f32]) -> Option<Vec<(f32, f32)>> {
+    /// Speech regions from one Silero pass, or `None` when VAD is unavailable or failed.
+    fn detect_speech(&self, audio: &[f32]) -> Option<SpeechRegions> {
         let path = self.vad_path.as_ref()?;
         if self.vad_failed.load(Ordering::SeqCst) {
             return None;
@@ -1032,23 +1045,36 @@ impl<B: Backend> WhisperEngine<B> {
             }
         };
         let level = crate::audio::level_for_vad(audio);
-        let regions = match ctx.segments_from_samples(WhisperVadParams::new(), &level) {
-            Ok(segs) => Some(
-                (0..segs.num_segments())
-                    .filter_map(|i| segs.get_segment(i))
-                    .map(|s| (s.start, s.end))
-                    .collect(),
-            ),
-            Err(e) => {
-                tracing::warn!(error = %e, "VAD run failed; decoding without VAD");
-                None
-            }
-        };
+        let mut guard_params = WhisperVadParams::new();
+        guard_params.set_min_speech_duration(guard::GUARD_MIN_SPEECH_MS);
+        let regions = ctx
+            .detect_speech(&level)
+            .and_then(|()| {
+                let plan = region_list(ctx.segments_from_probabilities(WhisperVadParams::new())?);
+                let guard = region_list(ctx.segments_from_probabilities(guard_params)?);
+                Ok(SpeechRegions { plan, guard })
+            })
+            .map_err(|e| tracing::warn!(error = %e, "VAD run failed; decoding without VAD"))
+            .ok();
         if regions.is_some() {
             drop(self.vad.give(ctx));
         }
         regions
     }
+}
+
+/// Segments as (start, end) pairs in centiseconds.
+fn region_list(segs: whisper_rs::WhisperVadSegments) -> Vec<(f32, f32)> {
+    (0..segs.num_segments())
+        .filter_map(|i| segs.get_segment(i))
+        .map(|s| (s.start, s.end))
+        .collect()
+}
+
+/// VAD regions in centiseconds from one Silero pass: `plan` with whisper.cpp's default parameters, `guard` with GUARD_MIN_SPEECH_MS.
+pub(crate) struct SpeechRegions {
+    pub plan: Vec<(f32, f32)>,
+    pub guard: Vec<(f32, f32)>,
 }
 
 /// Request language wins; otherwise detect per chunk until one yields text, then pin it.
@@ -1126,7 +1152,10 @@ impl<B: Backend> Transcriber for WhisperEngine<B> {
             return Some(Vec::new());
         }
         let want_vad = opts.vad.unwrap_or(self.vad_default);
-        let regions = want_vad.then(|| self.detect_speech(audio)).flatten();
+        let regions = want_vad
+            .then(|| self.detect_speech(audio))
+            .flatten()
+            .map(|r| r.plan);
         if cancel.load(Ordering::SeqCst) {
             return None;
         }
@@ -1172,14 +1201,24 @@ impl<B: Backend> Transcriber for WhisperEngine<B> {
             return Ok(result);
         }
         let want_vad = opts.vad.unwrap_or(self.vad_default);
-        let regions = if want_vad {
-            self.detect_speech(audio)
-        } else {
-            None
-        };
+        let speech = self.detect_speech(audio);
         if req.cancel.load(Ordering::SeqCst) {
             return Err(EngineError::Cancelled);
         }
+        if speech.as_ref().is_some_and(|r| r.guard.is_empty()) {
+            tracing::info!("no speech detected; skipped decoding");
+            return Ok(result);
+        }
+        let speech_secs = speech
+            .as_ref()
+            .map(|r| guard::regions_secs(&r.guard))
+            .unwrap_or_default();
+        let regions = if want_vad {
+            speech.as_ref().map(|r| r.plan.as_slice())
+        } else {
+            None
+        };
+        let decoded_end;
         let mut lang = LanguagePin {
             request: opts.language.clone(),
             pinned: None,
@@ -1227,18 +1266,21 @@ impl<B: Backend> Transcriber for WhisperEngine<B> {
         };
         match regions {
             Some(regions) => {
-                let plan = pipeline::plan_vad_chunks_compacted(&regions, audio.len());
+                let plan = pipeline::plan_vad_chunks_compacted(regions, audio.len());
+                decoded_end = plan.last().map_or(0, |(span, _)| span.end);
                 let n = plan.len();
                 for (i, (span, pieces)) in plan.into_iter().enumerate() {
                     run(span, pieces, i + 1 == n, &mut segments)?;
                 }
             }
             None => {
+                let decode_end = guard::decode_end(&speech_secs, audio.len());
+                decoded_end = decode_end;
                 let mut cursor = 0usize;
-                while audio.len() - cursor >= MIN_CHUNK {
-                    let is_last = pipeline::window_is_last(audio.len(), cursor);
+                while decode_end - cursor >= MIN_CHUNK {
+                    let is_last = pipeline::window_is_last(decode_end, cursor);
                     let end = if is_last {
-                        audio.len()
+                        decode_end
                     } else {
                         cursor + MAX_CHUNK
                     };
@@ -1259,6 +1301,26 @@ impl<B: Backend> Transcriber for WhisperEngine<B> {
                     cursor += advance;
                 }
             }
+        }
+        if !speech_secs.is_empty() {
+            let (kept, n) = guard::drop_unvoiced(segments, &speech_secs, guard::VOICED_PAD_SECS);
+            segments = kept;
+            if n > 0 {
+                tracing::info!("dropped unvoiced words={n}");
+            }
+        }
+        if let Some(prompt) = initial_prompt(opts, self.prompt_style, usize::MAX, &|_| 0) {
+            let (kept, n) = guard::drop_prompt_echo(segments, &prompt, &vocabulary_terms(opts));
+            segments = kept;
+            if n > 0 {
+                tracing::info!("dropped prompt echo words={n}");
+            }
+        }
+        let end_secs = decoded_end as f64 / f64::from(crate::audio::SAMPLE_RATE);
+        let (kept, n) = guard::drop_end_repeat(segments, end_secs);
+        segments = kept;
+        if n > 0 {
+            tracing::info!("dropped end repeat words={n}");
         }
         let (segments, repetitions) = pipeline::finalize_segments(segments);
         for r in &repetitions {
@@ -1479,6 +1541,34 @@ fn make_params<'a>(
     params
 }
 
+/// The initial prompt of a request: profile terms and the request prompt in `style`, without NUL prompts.
+fn initial_prompt(
+    opts: &DecodeOptions,
+    style: PromptStyle,
+    limit: usize,
+    count: &dyn Fn(&str) -> usize,
+) -> Option<String> {
+    pipeline::build_initial_prompt(
+        &opts.vocabulary,
+        opts.prompt.as_deref(),
+        style,
+        limit,
+        count,
+    )
+    .filter(|p| !p.contains('\0'))
+}
+
+/// Profile terms plus the terms of a list-style request prompt, exact duplicates removed.
+fn vocabulary_terms(opts: &DecodeOptions) -> Vec<String> {
+    let mut terms = opts.vocabulary.clone();
+    if let Some(p) = opts.prompt.as_deref() {
+        terms.extend(pipeline::prompt_terms(p));
+    }
+    let mut seen = HashSet::new();
+    terms.retain(|t| seen.insert(t.clone()));
+    terms
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_chunk(
     loaded: &Loaded,
@@ -1488,6 +1578,7 @@ fn decode_chunk(
     opts: &DecodeOptions,
     language: Option<&str>,
     threads: i32,
+    style: PromptStyle,
     abort: &AtomicBool,
 ) -> Result<ChunkOut, DecodeFailure> {
     let limit = (loaded.ctx.n_text_ctx().max(2) / 2) as usize;
@@ -1497,9 +1588,8 @@ fn decode_chunk(
             .tokenize(t, t.len() + 8)
             .map_or(t.len(), |v| v.len())
     };
-    let prompt =
-        pipeline::build_initial_prompt(&opts.vocabulary, opts.prompt.as_deref(), limit, &count)
-            .filter(|p| !p.contains('\0'));
+    let prompt = initial_prompt(opts, style, limit, &count);
+    let terms = vocabulary_terms(opts);
     let abort_ctx = AbortCtx {
         flag: abort,
         tripped: AtomicBool::new(false),
@@ -1565,9 +1655,17 @@ fn decode_chunk(
             }
         }
     }
-    let (segments, dropped) = pipeline::drop_collapsed_tail(segments, chunk_end);
+    let (mut segments, dropped) = pipeline::drop_collapsed_tail(segments, chunk_end);
     if dropped > 0 {
         tracing::info!("dropped collapsed tail words={dropped}");
+    }
+    if !terms.is_empty() {
+        for seg in &mut segments {
+            seg.text = pipeline::canonical_case(&seg.text, &terms);
+            for w in &mut seg.words {
+                w.word = pipeline::canonical_case(&w.word, &terms);
+            }
+        }
     }
     Ok(ChunkOut { segments, detected })
 }

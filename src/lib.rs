@@ -5,6 +5,7 @@ pub mod config;
 pub mod doctor;
 pub mod engine;
 pub mod format;
+pub mod guard;
 pub mod jobs;
 pub mod models;
 pub mod notify;
