@@ -1,0 +1,150 @@
+{
+  "vocabulary": "Nginx, Yggdrasil, Zstandard, Ghidra, Oluwaseun, Grafana, Kubernetes, tmux",
+  "confusions": {
+    "Nginx": [
+      "Engine X",
+      "Engine-X",
+      "EngineX",
+      "engine x"
+    ]
+  },
+  "gates": {
+    "vocab_recall_min": 0.8,
+    "confusions_max": 0,
+    "silence_words_max": 0,
+    "tail_extra_words_max": 0,
+    "duplicates_max": 0
+  },
+  "tone": "clips/tone-room.wav",
+  "tails": [
+    3,
+    8,
+    20
+  ],
+  "items": [
+    {
+      "id": "v1",
+      "audio": "clips/v1.wav",
+      "kind": "vocab",
+      "expect": {
+        "Nginx": 1
+      },
+      "reference": "Restart Nginx on the staging box before the demo.",
+      "tail": true
+    },
+    {
+      "id": "v2",
+      "audio": "clips/v2.wav",
+      "kind": "vocab",
+      "expect": {
+        "Yggdrasil": 1
+      },
+      "reference": "The Yggdrasil service writes its logs to the shared volume.",
+      "tail": true
+    },
+    {
+      "id": "v3",
+      "audio": "clips/v3.wav",
+      "kind": "vocab",
+      "expect": {
+        "Nginx": 1,
+        "Zstandard": 1
+      },
+      "reference": "Compress the Nginx logs with Zstandard before the upload.",
+      "tail": true
+    },
+    {
+      "id": "v4",
+      "audio": "clips/v4.wav",
+      "kind": "vocab",
+      "expect": {
+        "Ghidra": 1,
+        "Oluwaseun": 1
+      },
+      "reference": "Oluwaseun reviewed the Ghidra report this morning.",
+      "tail": true
+    },
+    {
+      "id": "v5",
+      "audio": "clips/v5.wav",
+      "kind": "vocab",
+      "expect": {
+        "Nginx": 1,
+        "Grafana": 1
+      },
+      "reference": "Point the Nginx proxy at the new Grafana dashboard.",
+      "tail": true
+    },
+    {
+      "id": "v6",
+      "audio": "clips/v6.wav",
+      "kind": "vocab",
+      "expect": {
+        "Yggdrasil": 1,
+        "Oluwaseun": 1
+      },
+      "reference": "Ask Oluwaseun to rerun the Yggdrasil migration.",
+      "tail": true
+    },
+    {
+      "id": "v7",
+      "audio": "clips/v7.wav",
+      "kind": "vocab",
+      "expect": {
+        "Ghidra": 1
+      },
+      "reference": "Open the Ghidra project and read the firmware strings.",
+      "tail": true
+    },
+    {
+      "id": "v8",
+      "audio": "clips/v8.wav",
+      "kind": "vocab",
+      "expect": {
+        "Nginx": 1,
+        "Zstandard": 1
+      },
+      "reference": "The Nginx config sits next to the Zstandard dictionary.",
+      "tail": true
+    },
+    {
+      "id": "s1",
+      "audio": "clips/s1.wav",
+      "kind": "speech",
+      "reference": "Please send the quarterly report to the finance team before Friday.",
+      "tail": true
+    },
+    {
+      "id": "s2",
+      "audio": "clips/s2.wav",
+      "kind": "speech",
+      "reference": "The weather in Lisbon was cold but the sky stayed clear all day.",
+      "tail": true
+    },
+    {
+      "id": "zeros-1s",
+      "audio": "clips/zeros-1s.wav",
+      "kind": "silence"
+    },
+    {
+      "id": "zeros-3s",
+      "audio": "clips/zeros-3s.wav",
+      "kind": "silence"
+    },
+    {
+      "id": "zeros-10s",
+      "audio": "clips/zeros-10s.wav",
+      "kind": "silence"
+    },
+    {
+      "id": "noise-3s",
+      "audio": "clips/noise-3s.wav",
+      "kind": "silence"
+    },
+    {
+      "id": "tone-room",
+      "audio": "clips/tone-room.wav",
+      "kind": "silence"
+    }
+  ]
+}
